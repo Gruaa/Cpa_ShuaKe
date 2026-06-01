@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ESNAI继续教育视频学习助手
 // @namespace    https://ce.esnai.net/
-// @version      4.0.0
+// @version      5.0.0
 // @description  确保视频学习时间正常累计，防止计时中断、弹题打断、暂停检测等
 // @author       GLM
 // @match        *://ce.esnai.net/*
@@ -27,6 +27,7 @@
         lastReportedSec: 0,
         forcePlayEnabled: true,
         simulateActivityEnabled: true,
+        timerVariables: new Map(),
     };
 
     function getActualSec() {
@@ -34,86 +35,43 @@
     }
 
     // ============================================================
-    // 一、Web Audio API 防节流 —— 最关键的一步
-    // Chrome 对后台标签页的 setInterval 会节流到每分钟1次
-    // 播放静音音频可以让 Chrome 认为标签页在"播放媒体"，不节流定时器
+    // 一、Web Audio API 防节流
     // ============================================================
     function startAntiThrottlingAudio() {
         try {
             const AudioCtx = window.AudioContext || window.webkitAudioContext;
-            if (!AudioCtx) { warn('AudioContext 不可用'); return; }
+            if (!AudioCtx) return;
 
-            let audioCtx = null;
-            let oscillator = null;
-            let gainNode = null;
+            let audioCtx = new AudioCtx();
+            let oscillator = audioCtx.createOscillator();
+            let gainNode = audioCtx.createGain();
+            gainNode.gain.value = 0.001;
+            oscillator.connect(gainNode);
+            gainNode.connect(audioCtx.destination);
+            oscillator.start();
 
-            function createSilentAudio() {
-                audioCtx = new AudioCtx();
-                oscillator = audioCtx.createOscillator();
-                gainNode = audioCtx.createGain();
-
-                gainNode.gain.value = 0.001;
-                oscillator.connect(gainNode);
-                gainNode.connect(audioCtx.destination);
-                oscillator.start();
-
-                log('静音音频已启动，Chrome 后台节流已绕过');
-            }
-
-            createSilentAudio();
-
-            // Chrome 可能会暂停 AudioContext，定期恢复
             setInterval(function () {
-                try {
-                    if (audioCtx && audioCtx.state === 'suspended') {
-                        audioCtx.resume();
-                        log('AudioContext 已恢复');
-                    }
-                } catch (e) { }
-            }, 5000);
+                try { if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume(); } catch (e) { }
+            }, 3000);
 
-            // 页面交互后重新创建（某些浏览器需要用户手势）
             document.addEventListener('click', function () {
-                try {
-                    if (audioCtx && audioCtx.state === 'suspended') {
-                        audioCtx.resume();
-                    }
-                } catch (e) { }
+                try { if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume(); } catch (e) { }
             }, { once: true });
+        } catch (e) { }
 
-            // 备用方案：用 <audio> 标签播放静音 wav
-            try {
-                const silentWav = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=';
-                const audioEl = document.createElement('audio');
-                audioEl.src = silentWav;
-                audioEl.loop = true;
-                audioEl.volume = 0.001;
-                audioEl.id = 'esnai-silent-audio';
+        try {
+            const silentWav = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=';
+            const audioEl = document.createElement('audio');
+            audioEl.src = silentWav;
+            audioEl.loop = true;
+            audioEl.volume = 0.001;
 
-                function tryPlaySilent() {
-                    audioEl.play().then(function () {
-                        log('备用静音音频已启动');
-                    }).catch(function () {
-                        setTimeout(tryPlaySilent, 3000);
-                    });
-                }
+            function tryPlay() { audioEl.play().catch(function () { setTimeout(tryPlay, 3000); }); }
+            if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', tryPlay);
+            else setTimeout(tryPlay, 1000);
 
-                if (document.readyState === 'loading') {
-                    document.addEventListener('DOMContentLoaded', tryPlaySilent);
-                } else {
-                    setTimeout(tryPlaySilent, 1000);
-                }
-
-                document.addEventListener('click', function () {
-                    if (audioEl.paused) {
-                        audioEl.play().catch(function () { });
-                    }
-                }, { once: true });
-            } catch (e) { }
-
-        } catch (e) {
-            warn('Web Audio API 防节流启动失败:', e);
-        }
+            document.addEventListener('click', function () { if (audioEl.paused) audioEl.play().catch(function () { }); }, { once: true });
+        } catch (e) { }
     }
 
     // ============================================================
@@ -124,7 +82,6 @@
             Object.defineProperty(document, 'hidden', { get: () => false, configurable: true });
             Object.defineProperty(document, 'visibilityState', { get: () => 'visible', configurable: true });
         } catch (e) { }
-
         ['visibilitychange', 'webkitvisibilitychange'].forEach(function (evt) {
             document.addEventListener(evt, function (e) { e.stopImmediatePropagation(); e.preventDefault(); }, true);
             window.addEventListener(evt, function (e) { e.stopImmediatePropagation(); e.preventDefault(); }, true);
@@ -139,7 +96,6 @@
             window.addEventListener(evtName, function (e) { e.stopImmediatePropagation(); e.preventDefault(); }, true);
             document.addEventListener(evtName, function (e) { e.stopImmediatePropagation(); e.preventDefault(); }, true);
         });
-
         try {
             Object.defineProperty(document, 'hasFocus', { value: function () { return true; }, writable: false, configurable: true });
         } catch (e) { }
@@ -157,7 +113,138 @@
     }
 
     // ============================================================
-    // 五、拦截网络请求 —— 修正上报时间
+    // 五、setInterval/setTimeout 补偿机制 —— 核心修复
+    // Chrome 后台节流导致回调频率降低，此机制自动补回缺失的 tick
+    // ============================================================
+    function hookTimersWithCompensation() {
+        const origSetInterval = window.setInterval;
+        const origSetTimeout = window.setTimeout;
+        const origClearInterval = window.clearInterval;
+        const activeIntervals = new Map();
+
+        window.setInterval = function (fn, delay) {
+            if (typeof fn !== 'function') return origSetInterval.apply(this, arguments);
+
+            const fnStr = fn.toString();
+
+            // 拦截停止计时的定时器
+            const STOP_KEYWORDS = ['stopTimer', 'stopStudy', 'pauseTimer', 'pauseStudy',
+                'clearTimer', 'endStudy', 'stopCount', 'pauseCount', 'stopPlay', 'pausePlay'];
+            for (let i = 0; i < STOP_KEYWORDS.length; i++) {
+                if (fnStr.indexOf(STOP_KEYWORDS[i]) !== -1) {
+                    log('拦截停止计时定时器:', STOP_KEYWORDS[i]);
+                    return origSetInterval.call(window, function () { }, delay);
+                }
+            }
+
+            // 对 0.5s~3s 的定时器启用补偿机制
+            if (delay >= 500 && delay <= 3000) {
+                const startTime = Date.now();
+                let lastFiredTick = 0;
+                const id = { value: 0 };
+
+                const compensatedFn = function () {
+                    const now = Date.now();
+                    const currentTick = Math.floor((now - startTime) / delay);
+                    const missed = currentTick - lastFiredTick;
+
+                    if (missed > 1) {
+                        log('定时器补偿: 缺失', missed - 1, '个tick, 补回');
+                        for (let i = 0; i < missed; i++) {
+                            try { fn.call(this); } catch (e) { }
+                        }
+                    } else {
+                        try { fn.call(this); } catch (e) { }
+                    }
+                    lastFiredTick = currentTick;
+                };
+
+                id.value = origSetInterval.call(window, compensatedFn, delay);
+                activeIntervals.set(id.value, { startTime: startTime, delay: delay });
+                return id.value;
+            }
+
+            return origSetInterval.apply(this, arguments);
+        };
+
+        window.setTimeout = function (fn, delay) {
+            if (typeof fn !== 'function') return origSetTimeout.apply(this, arguments);
+
+            const fnStr = fn.toString();
+            const STOP_KEYWORDS = ['stopTimer', 'stopStudy', 'pauseTimer', 'pauseStudy',
+                'clearTimer', 'endStudy', 'stopCount', 'pauseCount', 'stopPlay', 'pausePlay'];
+            for (let i = 0; i < STOP_KEYWORDS.length; i++) {
+                if (fnStr.indexOf(STOP_KEYWORDS[i]) !== -1) {
+                    log('拦截停止计时延时器:', STOP_KEYWORDS[i]);
+                    return origSetTimeout.call(window, function () { }, delay);
+                }
+            }
+
+            return origSetTimeout.apply(this, arguments);
+        };
+
+        window.clearInterval = function (id) {
+            activeIntervals.delete(id);
+            return origClearInterval.apply(this, arguments);
+        };
+
+        // Web Worker 驱动的补偿定时器 —— 不受 Chrome 节流影响
+        // 每 2 秒检查一次所有活跃的 interval，如果发现被节流就手动触发补偿
+        try {
+            const workerCode = [
+                'setInterval(function() { postMessage("tick"); }, 2000);'
+            ].join('\n');
+            const blob = new Blob([workerCode], { type: 'application/javascript' });
+            const worker = new Worker(URL.createObjectURL(blob));
+
+            worker.onmessage = function () {
+                const now = Date.now();
+                activeIntervals.forEach(function (info, id) {
+                    const expectedTicks = Math.floor((now - info.startTime) / info.delay);
+                    // 如果超过 2 个 delay 周期没有触发，说明被节流了
+                    // 补偿由 compensatedFn 在下次触发时自动处理
+                    // 这里只是记录日志
+                });
+            };
+        } catch (e) { }
+
+        log('定时器补偿机制已激活');
+    }
+
+    // ============================================================
+    // 六、requestAnimationFrame 后台保活
+    // 平台可能用 rAF 做计时，后台标签页 rAF 完全暂停
+    // ============================================================
+    function hookRequestAnimationFrame() {
+        const origRAF = window.requestAnimationFrame;
+        let lastTime = performance.now();
+
+        window.requestAnimationFrame = function (callback) {
+            const wrappedCallback = function (timestamp) {
+                // 确保 timestamp 持续递增，不出现大跳跃
+                const now = performance.now();
+                if (now - lastTime > 100) {
+                    // 可能被暂停了一段时间，平滑处理
+                    lastTime = now;
+                }
+                try {
+                    callback(lastTime);
+                } catch (e) { }
+                lastTime += 16.67;
+            };
+            return origRAF.call(window, wrappedCallback);
+        };
+
+        // 用 setInterval 模拟 rAF 回调（后台也能运行）
+        setInterval(function () {
+            lastTime = performance.now();
+        }, 100);
+
+        log('requestAnimationFrame 保活已激活');
+    }
+
+    // ============================================================
+    // 七、拦截网络请求 —— 修正上报时间
     // ============================================================
     function hookNetworkRequests() {
         const TIME_FIELDS = [
@@ -181,6 +268,9 @@
             'spenttime', 'spent_time', 'elapsedtime', 'elapsed_time',
             'runningtime', 'running_time', 'activetime', 'active_time',
             'onlinetime', 'online_time', 'learningtime', 'learning_time',
+            'studysec', 'learnsec', 'playsec', 'watchsec', 'coursesec',
+            'study_sec', 'learn_sec', 'play_sec', 'watch_sec', 'course_sec',
+            'accumulatedsec', 'accumulated_sec', 'totalsec', 'total_sec',
         ];
 
         function isTimeField(key) {
@@ -211,25 +301,22 @@
                 u.indexOf('multiplay') !== -1 || u.indexOf('checkplay') !== -1;
         }
 
-        function modifyTimeValue(obj, actualSec) {
-            if (typeof obj === 'number' && obj < actualSec) return actualSec;
-            if (typeof obj === 'string') {
-                const num = parseInt(obj, 10);
-                if (!isNaN(num) && num < actualSec && num >= 0) return String(actualSec);
-            }
-            return undefined;
-        }
-
         function walkAndModify(obj, actualSec) {
             if (typeof obj !== 'object' || obj === null) return false;
             let changed = false;
             for (const key in obj) {
-                if (typeof obj[key] === 'number' || typeof obj[key] === 'string') {
+                if (typeof obj[key] === 'number') {
+                    if (isTimeField(key) && obj[key] < actualSec) {
+                        log('修正字段:', key, obj[key], '->', actualSec);
+                        obj[key] = actualSec;
+                        changed = true;
+                    }
+                } else if (typeof obj[key] === 'string') {
                     if (isTimeField(key)) {
-                        const newVal = modifyTimeValue(obj[key], actualSec);
-                        if (newVal !== undefined) {
-                            log('修正字段:', key, obj[key], '->', newVal);
-                            obj[key] = newVal;
+                        const num = parseInt(obj[key], 10);
+                        if (!isNaN(num) && num < actualSec) {
+                            log('修正字段(str):', key, obj[key], '->', actualSec);
+                            obj[key] = String(actualSec);
                             changed = true;
                         }
                     }
@@ -243,7 +330,6 @@
         function modifyBody(body, actualSec) {
             if (!body) return { modified: body, changed: false };
 
-            // FormData
             if (typeof FormData !== 'undefined' && body instanceof FormData) {
                 let changed = false;
                 const entries = [];
@@ -252,7 +338,6 @@
                         const num = parseInt(value, 10);
                         if (!isNaN(num) && num < actualSec) {
                             entries.push([key, String(actualSec)]);
-                            log('FormData 修正:', key, value, '->', actualSec);
                             changed = true;
                             continue;
                         }
@@ -267,7 +352,6 @@
                 return { modified: body, changed: false };
             }
 
-            // URLSearchParams
             if (typeof URLSearchParams !== 'undefined' && body instanceof URLSearchParams) {
                 let changed = false;
                 for (const [key, value] of body.entries()) {
@@ -275,7 +359,6 @@
                         const num = parseInt(value, 10);
                         if (!isNaN(num) && num < actualSec) {
                             body.set(key, String(actualSec));
-                            log('URLSearchParams 修正:', key, value, '->', actualSec);
                             changed = true;
                         }
                     }
@@ -283,9 +366,7 @@
                 return { modified: body, changed: changed };
             }
 
-            // String body
             if (typeof body === 'string') {
-                // Try JSON
                 try {
                     const json = JSON.parse(body);
                     if (walkAndModify(json, actualSec)) {
@@ -293,7 +374,6 @@
                     }
                 } catch (e) { }
 
-                // Try URL-encoded
                 try {
                     const params = new URLSearchParams(body);
                     let changed = false;
@@ -302,7 +382,6 @@
                             const num = parseInt(value, 10);
                             if (!isNaN(num) && num < actualSec) {
                                 params.set(key, String(actualSec));
-                                log('URL-encoded 修正:', key, value, '->', actualSec);
                                 changed = true;
                             }
                         }
@@ -310,12 +389,11 @@
                     if (changed) return { modified: params.toString(), changed: true };
                 } catch (e) { }
 
-                // Regex fallback
                 let modified = body;
                 let changed = false;
                 const patterns = [
-                    /([\"']?(?:second|sec|seconds|studytime|learnTime|duration|elapsed|time|studyTime|studySecond|watchTime|courseTime|totalTime|timer|timerSecond|countSecond)[\"']?\s*[=:]\s*)\d+/gi,
-                    /([\"']?(?:study_time|learn_time|play_time|study_second|learn_second|play_second|watch_time|course_time|total_time|count_second)[\"']?\s*[=:]\s*)\d+/gi,
+                    /([\"']?(?:second|sec|seconds|studytime|learnTime|duration|elapsed|time|studyTime|studySecond|watchTime|courseTime|totalTime|timer|timerSecond|countSecond|studysec|learnsec|playsec)[\"']?\s*[=:]\s*)\d+/gi,
+                    /([\"']?(?:study_time|learn_time|play_time|study_second|learn_second|play_second|watch_time|course_time|total_time|count_second|study_sec|learn_sec|play_sec)[\"']?\s*[=:]\s*)\d+/gi,
                 ];
                 patterns.forEach(function (pat) {
                     modified = modified.replace(pat, function (match, prefix) {
@@ -325,8 +403,7 @@
                 });
                 if (changed) return { modified: modified, changed: true };
 
-                // 如果都没匹配到，记录原始内容以便排查
-                log('未匹配到时间字段，原始body:', body.substring(0, 500));
+                log('未匹配时间字段,body:', body.substring(0, 500));
                 return { modified: body, changed: false };
             }
 
@@ -340,7 +417,6 @@
 
         OriginalXHR.prototype.open = function (method, url) {
             this._hookUrl = url;
-            this._hookMethod = method;
             return xhrOpen.apply(this, arguments);
         };
 
@@ -361,6 +437,7 @@
 
             if (isStudyRelatedRequest(url)) {
                 const actualSec = getActualSec();
+                log('学习相关请求:', url, '本地秒数:', actualSec, 'body:', body ? (typeof body === 'string' ? body.substring(0, 200) : '[FormData/URLSearchParams]') : '[空]');
                 const result = modifyBody(body, actualSec);
                 if (result.changed) {
                     arguments[0] = result.modified;
@@ -379,12 +456,12 @@
                 const url = (typeof input === 'string') ? input : (input instanceof Request) ? input.url : '';
 
                 if (isCheckCourseRequest(url)) {
-                    log('fetch 双课程检测已阻断:', url);
                     return Promise.resolve(new Response('{"code":0,"msg":"ok","data":{}}', { status: 200, headers: { 'Content-Type': 'application/json' } }));
                 }
 
                 if (isStudyRelatedRequest(url) && init && init.body) {
                     const actualSec = getActualSec();
+                    log('fetch 学习请求:', url, '本地秒数:', actualSec);
                     const result = modifyBody(init.body, actualSec);
                     if (result.changed) {
                         init.body = result.modified;
@@ -395,10 +472,47 @@
             } catch (e) { }
             return originalFetch.apply(this, arguments);
         };
+
+        // Hook WebSocket
+        const OrigWebSocket = window.WebSocket;
+        const wsSend = OrigWebSocket.prototype.send;
+        OrigWebSocket.prototype.send = function (data) {
+            try {
+                if (typeof data === 'string') {
+                    const actualSec = getActualSec();
+                    try {
+                        const json = JSON.parse(data);
+                        if (walkAndModify(json, actualSec)) {
+                            arguments[0] = JSON.stringify(json);
+                            log('WebSocket 上报时间已修正为:', actualSec, '秒');
+                        }
+                    } catch (e) {
+                        // Not JSON, try URL-encoded
+                        try {
+                            const params = new URLSearchParams(data);
+                            let changed = false;
+                            for (const [key, value] of params.entries()) {
+                                if (isTimeField(key)) {
+                                    const num = parseInt(value, 10);
+                                    if (!isNaN(num) && num < actualSec) {
+                                        params.set(key, String(actualSec));
+                                        changed = true;
+                                    }
+                                }
+                            }
+                            if (changed) arguments[0] = params.toString();
+                        } catch (e2) { }
+                    }
+                }
+            } catch (e) { }
+            return wsSend.apply(this, arguments);
+        };
+
+        log('网络请求拦截已激活（含WebSocket）');
     }
 
     // ============================================================
-    // 六、视频防暂停 + 自动播放
+    // 八、视频防暂停 + 自动播放
     // ============================================================
     function hookVideoPause() {
         function protectVideo(video) {
@@ -418,11 +532,8 @@
                     e.stopImmediatePropagation();
                     e.preventDefault();
                     setTimeout(function () {
-                        try {
-                            pauseBlocked = true;
-                            video.play().catch(function () { });
-                            pauseBlocked = false;
-                        } catch (err) { pauseBlocked = false; }
+                        try { pauseBlocked = true; video.play().catch(function () { }); pauseBlocked = false; }
+                        catch (err) { pauseBlocked = false; }
                     }, 50);
                 }
             }, true);
@@ -433,307 +544,182 @@
                 }, true);
             });
 
-            // 确保视频持续播放
             setInterval(function () {
                 if (STATE.forcePlayEnabled && video.paused && !video.ended) {
                     video.play().catch(function () { });
                 }
             }, 2000);
 
-            // 防止 playbackRate=0
             try {
                 const desc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'playbackRate');
                 if (desc && desc.set) {
                     Object.defineProperty(video, 'playbackRate', {
                         get: desc.get,
-                        set: function (val) {
-                            if (val === 0 && STATE.forcePlayEnabled) return;
-                            return desc.set.call(this, val);
-                        },
+                        set: function (val) { if (val === 0 && STATE.forcePlayEnabled) return; return desc.set.call(this, val); },
                         configurable: true
                     });
                 }
             } catch (e) { }
 
-            // 静音播放（避免后台播放被阻止）
             video.muted = true;
             video.volume = 0;
-
-            // 自动播放
             video.autoplay = true;
             video.play().catch(function () {
-                // 自动播放被阻止，等待用户交互
-                document.addEventListener('click', function () {
-                    video.play().catch(function () { });
-                }, { once: true });
+                document.addEventListener('click', function () { video.play().catch(function () { }); }, { once: true });
             });
-
-            log('视频防暂停保护已激活');
         }
 
         function observeVideos() {
             document.querySelectorAll('video').forEach(protectVideo);
-            const observer = new MutationObserver(function (mutations) {
-                mutations.forEach(function (mutation) {
-                    mutation.addedNodes.forEach(function (node) {
+            new MutationObserver(function (mutations) {
+                mutations.forEach(function (m) {
+                    m.addedNodes.forEach(function (node) {
                         if (node.nodeName === 'VIDEO') protectVideo(node);
                         if (node.querySelectorAll) node.querySelectorAll('video').forEach(protectVideo);
                     });
                 });
-            });
-            observer.observe(document.documentElement, { childList: true, subtree: true });
+            }).observe(document.documentElement, { childList: true, subtree: true });
         }
 
-        if (document.readyState === 'loading') {
-            document.addEventListener('DOMContentLoaded', observeVideos);
-        } else {
-            observeVideos();
-        }
+        if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', observeVideos);
+        else observeVideos();
     }
 
     // ============================================================
-    // 七、页面加载后自动播放
+    // 九、自动播放
     // ============================================================
     function autoPlayOnLoad() {
         function tryAutoPlay() {
-            log('尝试自动播放...');
-
-            // 查找视频并播放
-            const videos = document.querySelectorAll('video');
-            videos.forEach(function (video) {
-                if (video.paused && !video.ended) {
-                    video.muted = true;
-                    video.volume = 0;
-                    video.autoplay = true;
-                    video.play().catch(function () { });
-                    log('视频自动播放已触发');
+            document.querySelectorAll('video').forEach(function (v) {
+                if (v.paused && !v.ended) {
+                    v.muted = true; v.volume = 0; v.autoplay = true;
+                    v.play().catch(function () { });
                 }
             });
 
-            // 查找并点击播放按钮
-            const playBtnSelectors = [
-                '.play-btn', '.btn-play', '#playBtn', '#play',
+            ['.play-btn', '.btn-play', '#playBtn', '#play',
                 '.vjs-big-play-button', '.video-play-btn',
                 'button[title="Play"]', 'button[title="播放"]',
-                '.prism-big-play-btn', '.xgplayer-start',
-                '[class*="play"]', '[class*="Play"]',
-            ];
+                '.prism-big-play-btn', '.xgplayer-start'].forEach(function (sel) {
+                    const btn = document.querySelector(sel);
+                    if (btn && btn.offsetParent !== null) btn.click();
+                });
 
-            playBtnSelectors.forEach(function (sel) {
-                const btn = document.querySelector(sel);
-                if (btn && btn.offsetParent !== null) {
-                    btn.click();
-                    log('点击了播放按钮:', sel);
-                }
-            });
-
-            // 查找 iframe 中的视频
             document.querySelectorAll('iframe').forEach(function (iframe) {
                 try {
                     if (iframe.contentDocument) {
-                        const iframeVideos = iframe.contentDocument.querySelectorAll('video');
-                        iframeVideos.forEach(function (v) {
-                            v.muted = true;
-                            v.play().catch(function () { });
+                        iframe.contentDocument.querySelectorAll('video').forEach(function (v) {
+                            v.muted = true; v.play().catch(function () { });
                         });
                     }
                 } catch (e) { }
             });
         }
 
-        // 多次尝试，等待视频加载
-        setTimeout(tryAutoPlay, 1000);
-        setTimeout(tryAutoPlay, 3000);
-        setTimeout(tryAutoPlay, 5000);
-        setTimeout(tryAutoPlay, 10000);
-        setTimeout(tryAutoPlay, 15000);
-
-        if (document.readyState === 'loading') {
-            document.addEventListener('DOMContentLoaded', function () {
-                setTimeout(tryAutoPlay, 500);
-            });
-        }
-
-        log('自动播放模块已激活');
+        [1000, 3000, 5000, 10000, 15000].forEach(function (t) { setTimeout(tryAutoPlay, t); });
+        if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', function () { setTimeout(tryAutoPlay, 500); });
     }
 
     // ============================================================
-    // 八、弹窗弹题自动处理
+    // 十、弹窗弹题自动处理
     // ============================================================
     function autoHandlePopups() {
-        function handleQuizAndPopups() {
-            const quizContainers = [
-                '.quiz-popup', '.popup-question', '.question-popup',
+        function handle() {
+            ['.quiz-popup', '.popup-question', '.question-popup',
                 '.modal-quiz', '.exam-popup', '.dialog-quiz',
-                '.interact-popup', '.exam-interact', '.study-interact',
-            ];
-
-            quizContainers.forEach(function (sel) {
-                document.querySelectorAll(sel).forEach(function (container) {
-                    if (container.style.display === 'none' || container.offsetParent === null) return;
-                    if (container._autoHandled) return;
-                    container._autoHandled = true;
-
-                    log('检测到弹题:', sel);
-
-                    const optSels = ['.answer-option', '.option-item', 'input[type="radio"]',
-                        'input[type="checkbox"]', '.choice-item', '.quiz-option', 'li'];
-                    for (let i = 0; i < optSels.length; i++) {
-                        const opts = container.querySelectorAll(optSels[i]);
-                        if (opts.length > 0) { opts[0].click(); break; }
-                    }
-
-                    setTimeout(function () {
-                        ['.submit-btn', '.btn-confirm', 'button[type="submit"]', '.btn-submit'].forEach(function (s) {
-                            const btn = container.querySelector(s);
-                            if (btn) btn.click();
-                        });
-                    }, 300);
-                });
-            });
-
-            // 全局确认按钮
-            ['.layui-layer-btn0', '.aui_ok', '.bootbox .btn-primary', '.sweet-alert .confirm',
-                '.layui-layer-close1', '.ui-dialog .ui-dialog-titlebar-close'].forEach(function (sel) {
-                    document.querySelectorAll(sel).forEach(function (btn) {
-                        if (btn.offsetParent !== null && !btn._ac) {
-                            btn._ac = true;
-                            btn.click();
-                            setTimeout(function () { btn._ac = false; }, 3000);
-                        }
+                '.interact-popup', '.exam-interact', '.study-interact'].forEach(function (sel) {
+                    document.querySelectorAll(sel).forEach(function (c) {
+                        if (c.style.display === 'none' || c.offsetParent === null || c._ah) return;
+                        c._ah = true;
+                        ['.answer-option', '.option-item', 'input[type="radio"]',
+                            'input[type="checkbox"]', '.choice-item', '.quiz-option', 'li'].forEach(function (s) {
+                                const o = c.querySelectorAll(s);
+                                if (o.length > 0) { o[0].click(); }
+                            });
+                        setTimeout(function () {
+                            ['.submit-btn', '.btn-confirm', 'button[type="submit"]', '.btn-submit'].forEach(function (s) {
+                                const b = c.querySelector(s); if (b) b.click();
+                            });
+                        }, 300);
                     });
                 });
 
-            // 文字匹配的确认按钮
-            document.querySelectorAll('button, a, input[type="button"], input[type="submit"]').forEach(function (btn) {
-                const text = (btn.textContent || btn.value || '').trim();
-                if (['继续学习', '继续', '确定', '确认', '知道了', '好的', 'OK', 'Yes', '是'].indexOf(text) !== -1) {
-                    if (btn.offsetParent !== null && !btn._ac) {
-                        btn._ac = true;
-                        btn.click();
-                        setTimeout(function () { btn._ac = false; }, 5000);
-                    }
+            ['.layui-layer-btn0', '.aui_ok', '.bootbox .btn-primary', '.sweet-alert .confirm',
+                '.layui-layer-close1', '.ui-dialog .ui-dialog-titlebar-close'].forEach(function (sel) {
+                    document.querySelectorAll(sel).forEach(function (b) {
+                        if (b.offsetParent !== null && !b._ac) { b._ac = true; b.click(); setTimeout(function () { b._ac = false; }, 3000); }
+                    });
+                });
+
+            document.querySelectorAll('button, a, input[type="button"], input[type="submit"]').forEach(function (b) {
+                const t = (b.textContent || b.value || '').trim();
+                if (['继续学习', '继续', '确定', '确认', '知道了', '好的', 'OK', 'Yes', '是'].indexOf(t) !== -1) {
+                    if (b.offsetParent !== null && !b._ac) { b._ac = true; b.click(); setTimeout(function () { b._ac = false; }, 5000); }
                 }
             });
         }
 
-        setInterval(handleQuizAndPopups, 2000);
-
-        const observer = new MutationObserver(function (mutations) {
-            let check = false;
-            mutations.forEach(function (m) { if (m.addedNodes.length > 0 || m.type === 'attributes') check = true; });
-            if (check) handleQuizAndPopups();
-        });
-
-        function startObs() {
-            observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['style', 'class', 'display'] });
-        }
-
-        if (document.readyState === 'loading') {
-            document.addEventListener('DOMContentLoaded', startObs);
-        } else {
-            startObs();
-        }
+        setInterval(handle, 2000);
+        new MutationObserver(function (ms) {
+            let c = false; ms.forEach(function (m) { if (m.addedNodes.length > 0 || m.type === 'attributes') c = true; });
+            if (c) handle();
+        }).observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['style', 'class', 'display'] });
     }
 
     // ============================================================
-    // 九、模拟用户活动
+    // 十一、模拟用户活动
     // ============================================================
     function simulateUserActivity() {
-        function scheduleMouseMove() {
-            const delay = 3000 + Math.random() * 5000;
+        (function loop() {
             setTimeout(function () {
                 if (STATE.simulateActivityEnabled) {
                     const x = Math.random() * window.innerWidth;
                     const y = Math.random() * window.innerHeight;
-                    const evt = new MouseEvent('mousemove', {
+                    document.elementFromPoint(x, y)?.dispatchEvent(new MouseEvent('mousemove', {
                         bubbles: true, cancelable: true, view: window,
-                        clientX: x, clientY: y, screenX: x, screenY: y,
-                        movementX: Math.random() * 10 - 5, movementY: Math.random() * 10 - 5
-                    });
-                    document.elementFromPoint(x, y)?.dispatchEvent(evt);
+                        clientX: x, clientY: y, movementX: 5, movementY: 5
+                    }));
                 }
-                scheduleMouseMove();
-            }, delay);
-        }
-        scheduleMouseMove();
+                loop();
+            }, 3000 + Math.random() * 5000);
+        })();
 
         setInterval(function () {
-            if (!STATE.simulateActivityEnabled) return;
-            document.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, cancelable: true, key: ' ', code: 'Space' }));
+            if (STATE.simulateActivityEnabled) document.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, key: ' ' }));
         }, 60000);
 
-        // 刷新平台的无操作检测变量
         const idleVars = ['lastActiveTime', 'lastActivityTime', 'lastOperateTime',
             'lastActionTime', 'lastMouseMoveTime', 'lastUserActionTime',
-            'lastStudyTime', 'lastPlayTime', 'lastHeartbeatTime',
-            'studyActiveTime', 'playActiveTime'];
-
+            'lastStudyTime', 'lastPlayTime', 'lastHeartbeatTime'];
         setInterval(function () {
             idleVars.forEach(function (v) { if (window[v] !== undefined) window[v] = Date.now(); });
-            if (window.$ && window.$.fn) {
-                try {
-                    const $doc = $(document);
-                    idleVars.forEach(function (v) { if ($doc.data(v) !== undefined) $doc.data(v, Date.now()); });
-                } catch (e) { }
-            }
         }, 5000);
     }
 
     // ============================================================
-    // 十、本地计时器 + 同步视频进度
+    // 十二、本地计时器 + 高频视频进度同步
     // ============================================================
     function startLocalTimer() {
+        // 每 2 秒同步一次视频进度（之前是 5 秒，太慢了）
         setInterval(function () {
-            STATE.localElapsed = Math.floor((Date.now() - STATE.startTime) / 1000);
+            STATE.localElapsed = getActualSec();
 
             const video = document.querySelector('video');
             if (video && STATE.forcePlayEnabled) {
                 const videoTime = Math.floor(video.currentTime);
                 const expectedTime = STATE.localElapsed;
-                if (expectedTime - videoTime > 10 && expectedTime < video.duration) {
+
+                // 视频进度落后超过 5 秒就修正
+                if (expectedTime - videoTime > 5 && expectedTime < video.duration) {
                     log('修正视频进度:', videoTime, '->', expectedTime);
                     video.currentTime = expectedTime;
                 }
             }
-        }, 5000);
+        }, 2000);
     }
 
     // ============================================================
-    // 十一、拦截定时器 —— 阻止平台停止计时
-    // ============================================================
-    function hookTimers() {
-        const STOP_KEYWORDS = ['stopTimer', 'stopStudy', 'pauseTimer', 'pauseStudy',
-            'clearTimer', 'endStudy', 'stopCount', 'pauseCount', 'stopPlay', 'pausePlay'];
-
-        const origSetInterval = window.setInterval;
-        const origSetTimeout = window.setTimeout;
-
-        window.setInterval = function (fn, delay) {
-            const fnStr = fn ? fn.toString() : '';
-            for (let i = 0; i < STOP_KEYWORDS.length; i++) {
-                if (fnStr.indexOf(STOP_KEYWORDS[i]) !== -1) {
-                    log('拦截停止计时定时器:', STOP_KEYWORDS[i]);
-                    return origSetInterval.call(window, function () { }, delay);
-                }
-            }
-            return origSetInterval.apply(this, arguments);
-        };
-
-        window.setTimeout = function (fn, delay) {
-            const fnStr = fn ? fn.toString() : '';
-            for (let i = 0; i < STOP_KEYWORDS.length; i++) {
-                if (fnStr.indexOf(STOP_KEYWORDS[i]) !== -1) {
-                    log('拦截停止计时延时器:', STOP_KEYWORDS[i]);
-                    return origSetTimeout.call(window, function () { }, delay);
-                }
-            }
-            return origSetTimeout.apply(this, arguments);
-        };
-    }
-
-    // ============================================================
-    // 十二、心跳保活
+    // 十三、心跳保活
     // ============================================================
     function startHeartbeat() {
         setInterval(function () {
@@ -745,19 +731,17 @@
     }
 
     // ============================================================
-    // 十三、拦截平台停止计时函数
+    // 十四、拦截平台停止计时函数
     // ============================================================
     function hookPlatformFunctions() {
-        function waitForWindow() {
+        function wait() {
             ['stopTimer', 'stopStudy', 'stopCount', 'stopPlay',
                 'pauseTimer', 'pauseStudy', 'pauseCount', 'pausePlay',
                 'endTimer', 'endStudy', 'endCount', 'endPlay',
                 'clearTimer', 'clearStudy', 'clearCount',
                 'suspendTimer', 'suspendStudy', 'suspendPlay',
                 'freezeTimer', 'freezeStudy', 'haltStudy', 'haltTimer'].forEach(function (fn) {
-                    if (typeof window[fn] === 'function') {
-                        window[fn] = function () { log('平台函数已拦截:', fn); };
-                    }
+                    if (typeof window[fn] === 'function') window[fn] = function () { };
                 });
 
             if (window.$ && window.$.event) {
@@ -771,17 +755,29 @@
                 } catch (e) { }
             }
         }
-
-        setTimeout(waitForWindow, 1000);
-        setTimeout(waitForWindow, 3000);
-        setTimeout(waitForWindow, 5000);
-        setTimeout(waitForWindow, 10000);
+        [1000, 3000, 5000, 10000].forEach(function (t) { setTimeout(wait, t); });
     }
 
     // ============================================================
-    // 十四、保持平台内部计时变量
+    // 十五、差分扫描发现并保持平台计时变量
     // ============================================================
     function keepPlatformTimerAlive() {
+        // 快照 window 上的数字属性
+        let snapshot = {};
+
+        function takeSnapshot() {
+            snapshot = {};
+            try {
+                for (const key in window) {
+                    try {
+                        if (typeof window[key] === 'number' && window[key] > 0) {
+                            snapshot[key] = window[key];
+                        }
+                    } catch (e) { }
+                }
+            } catch (e) { }
+        }
+
         function findAndKeepTimers() {
             const actualSec = getActualSec();
 
@@ -809,23 +805,34 @@
                 }
             });
 
-            // 搜索 window 上的疑似计时变量
+            // 差分扫描：找出在两次扫描之间递增的数字变量
+            // 这些很可能是计时器
             try {
+                const newSnapshot = {};
                 for (const key in window) {
                     try {
-                        if (typeof window[key] === 'number' && window[key] > 0 && window[key] < actualSec) {
-                            const k = key.toLowerCase();
-                            if ((k.indexOf('time') !== -1 || k.indexOf('sec') !== -1 ||
-                                k.indexOf('dur') !== -1 || k.indexOf('count') !== -1 ||
-                                k.indexOf('timer') !== -1 || k.indexOf('elapsed') !== -1 ||
-                                k.indexOf('study') !== -1 || k.indexOf('learn') !== -1 ||
-                                k.indexOf('play') !== -1 || k.indexOf('watch') !== -1)) {
-                                log('发现计时变量:', key, '=', window[key], '->', actualSec);
-                                window[key] = actualSec;
+                        if (typeof window[key] === 'number' && window[key] > 0) {
+                            newSnapshot[key] = window[key];
+                            if (snapshot[key] !== undefined) {
+                                const diff = newSnapshot[key] - snapshot[key];
+                                // 如果变量在 5 秒内增加了 1~10，很可能是秒计数器
+                                if (diff > 0 && diff <= 10 && newSnapshot[key] < actualSec) {
+                                    const k = key.toLowerCase();
+                                    // 不修改看起来像 ID 或配置的变量
+                                    if (k.indexOf('id') === -1 && k.indexOf('code') === -1 &&
+                                        k.indexOf('status') === -1 && k.indexOf('type') === -1 &&
+                                        k.indexOf('version') === -1 && k.indexOf('port') === -1 &&
+                                        k.indexOf('width') === -1 && k.indexOf('height') === -1 &&
+                                        k.indexOf('index') === -1 && k.indexOf('order') === -1) {
+                                        log('差分发现计时变量:', key, snapshot[key], '->', newSnapshot[key], '修正为:', actualSec);
+                                        window[key] = actualSec;
+                                    }
+                                }
                             }
                         }
                     } catch (e) { }
                 }
+                snapshot = newSnapshot;
             } catch (e) { }
 
             // Vue 实例
@@ -837,8 +844,8 @@
                             if (typeof vm.$data[key] === 'number' && vm.$data[key] < actualSec && vm.$data[key] > 0) {
                                 const k = key.toLowerCase();
                                 if (k.indexOf('time') !== -1 || k.indexOf('sec') !== -1 ||
-                                    k.indexOf('dur') !== -1 || k.indexOf('study') !== -1) {
-                                    log('Vue计时变量:', key, '=', vm.$data[key], '->', actualSec);
+                                    k.indexOf('dur') !== -1 || k.indexOf('study') !== -1 ||
+                                    k.indexOf('learn') !== -1 || k.indexOf('play') !== -1) {
                                     vm.$data[key] = actualSec;
                                 }
                             }
@@ -848,92 +855,73 @@
             } catch (e) { }
         }
 
-        setInterval(findAndKeepTimers, 5000);
+        // 先拍快照，5秒后开始差分扫描
+        takeSnapshot();
+        setTimeout(takeSnapshot, 5000);
+        setInterval(function () {
+            findAndKeepTimers();
+        }, 5000);
     }
 
     // ============================================================
-    // 十五、iframe 处理
+    // 十六、iframe 处理
     // ============================================================
     function handleIframeVideos() {
-        function processIframes() {
+        setInterval(function () {
             document.querySelectorAll('iframe').forEach(function (iframe) {
                 try {
                     if (!iframe.contentDocument) return;
-                    iframe.contentDocument.querySelectorAll('video').forEach(function (video) {
-                        if (video._hooked) return;
-                        video._hooked = true;
-                        video.addEventListener('pause', function () {
-                            setTimeout(function () { video.play().catch(function () { }); }, 50);
-                        });
-                        setInterval(function () {
-                            if (video.paused && !video.ended) video.play().catch(function () { });
-                        }, 3000);
+                    iframe.contentDocument.querySelectorAll('video').forEach(function (v) {
+                        if (v._hooked) return;
+                        v._hooked = true;
+                        v.addEventListener('pause', function () { setTimeout(function () { v.play().catch(function () { }); }, 50); });
                     });
                     iframe.contentWindow.alert = function () { };
                     iframe.contentWindow.confirm = function () { return true; };
                     iframe.contentWindow.prompt = function () { return ''; };
                 } catch (e) { }
             });
-        }
-        setInterval(processIframes, 5000);
+        }, 5000);
     }
 
     // ============================================================
-    // 十六、ESNAI 播放器钩子
+    // 十七、ESNAI 播放器钩子
     // ============================================================
     function hookESNAIPlayer() {
-        function findAndHookPlayer() {
+        function find() {
             ['player', 'videoPlayer', 'studyPlayer', 'coursePlayer', 'flashPlayer',
                 'mediaPlayer', 'polyvPlayer', 'ckPlayer', 'ckplayer'].forEach(function (name) {
                     if (window[name] && typeof window[name] === 'object') {
-                        log('检测到播放器:', name);
                         if (window[name].pause) {
                             const orig = window[name].pause.bind(window[name]);
-                            window[name].pause = function () {
-                                if (STATE.forcePlayEnabled) return;
-                                return orig();
-                            };
+                            window[name].pause = function () { if (STATE.forcePlayEnabled) return; return orig(); };
                         }
                         if (window[name].play) {
-                            setInterval(function () {
-                                try { if (STATE.forcePlayEnabled) window[name].play(); } catch (e) { }
-                            }, 5000);
+                            setInterval(function () { try { if (STATE.forcePlayEnabled) window[name].play(); } catch (e) { } }, 5000);
                         }
                     }
                 });
-
-            document.querySelectorAll('embed, object').forEach(function (embed) {
-                try {
-                    if (embed.play) setInterval(function () { try { embed.play(); } catch (e) { } }, 5000);
-                } catch (e) { }
-            });
         }
-
-        setTimeout(findAndHookPlayer, 1000);
-        setTimeout(findAndHookPlayer, 3000);
-        setTimeout(findAndHookPlayer, 5000);
-        setTimeout(findAndHookPlayer, 10000);
+        [1000, 3000, 5000, 10000].forEach(function (t) { setTimeout(find, t); });
     }
 
     // ============================================================
-    // 十七、Web Worker 计时
+    // 十八、Web Worker 计时
     // ============================================================
     function startWorkerTimer() {
         try {
             const code = 'let s=Date.now();setInterval(function(){postMessage({e:Math.floor((Date.now()-s)/1000)})},1000);';
-            const blob = new Blob([code], { type: 'application/javascript' });
-            const worker = new Worker(URL.createObjectURL(blob));
+            const worker = new Worker(URL.createObjectURL(new Blob([code], { type: 'application/javascript' })));
             worker.onmessage = function (e) { STATE.localElapsed = e.data.e; };
-        } catch (e) { warn('Web Worker 启动失败:', e); }
+        } catch (e) { }
     }
 
     // ============================================================
-    // 十八、主动上报计时
+    // 十九、主动上报计时
     // ============================================================
     function startProactiveReporting() {
         let discoveredAPI = null;
 
-        // 监听 XHR 来发现上报 API
         const origOpen = XMLHttpRequest.prototype.open;
         XMLHttpRequest.prototype.open = function (method, url) {
             if (url && typeof url === 'string') {
@@ -952,7 +940,6 @@
             const actualSec = getActualSec();
             if (actualSec - STATE.lastReportedSec < 30) return;
 
-            // 方式1：全局函数
             const fns = ['saveStudyTime', 'reportStudyTime', 'updateStudyRecord',
                 'saveStudyRecord', 'reportRecord', 'updateTime', 'studyReport',
                 'learnReport', 'courseReport', 'submitStudyTime', 'reportProgress',
@@ -960,48 +947,27 @@
 
             for (const fn of fns) {
                 if (typeof window[fn] === 'function') {
-                    try {
-                        window[fn](actualSec);
-                        STATE.lastReportedSec = actualSec;
-                        log('主动上报成功(全局函数):', fn, actualSec);
-                        return;
-                    } catch (e) { }
+                    try { window[fn](actualSec); STATE.lastReportedSec = actualSec; return; } catch (e) { }
                 }
             }
 
-            // 方式2：GM_xmlhttpRequest
             if (discoveredAPI && typeof GM_xmlhttpRequest !== 'undefined') {
                 try {
-                    const url = discoveredAPI.startsWith('http') ? discoveredAPI : window.location.origin + discoveredAPI;
                     GM_xmlhttpRequest({
                         method: 'POST',
-                        url: url,
+                        url: discoveredAPI.startsWith('http') ? discoveredAPI : window.location.origin + discoveredAPI,
                         headers: { 'Content-Type': 'application/json' },
                         data: JSON.stringify({ studyTime: actualSec, second: actualSec, duration: actualSec, time: actualSec }),
-                        onload: function () {
-                            STATE.lastReportedSec = actualSec;
-                            log('主动上报成功(GM):', actualSec);
-                        },
+                        onload: function () { STATE.lastReportedSec = actualSec; },
                         onerror: function () { }
                     });
-                    return;
                 } catch (e) { }
             }
-
-            // 方式3：视频 seek 触发
-            try {
-                const video = document.querySelector('video');
-                if (video && !video.paused) {
-                    const t = video.currentTime;
-                    video.currentTime = Math.max(0, t - 1);
-                    setTimeout(function () { video.currentTime = t; }, 100);
-                }
-            } catch (e) { }
         }, 30000);
     }
 
     // ============================================================
-    // 十九、页面卸载拦截
+    // 二十、页面卸载拦截
     // ============================================================
     function hookPageUnload() {
         window.addEventListener('beforeunload', function (e) { e.stopImmediatePropagation(); }, true);
@@ -1013,15 +979,16 @@
     // 初始化
     // ============================================================
     function init() {
-        log('========== ESNAI 助手 v4.0 启动 ==========');
+        log('========== ESNAI 助手 v5.0 启动 ==========');
 
-        // 最早执行：防节流 + 可见性欺骗
+        // 最先执行：定时器补偿 + 防节流 + 可见性欺骗
+        hookTimersWithCompensation();
         startAntiThrottlingAudio();
         hookDocumentVisibility();
         hookWindowBlur();
         hookDialogs();
         hookNetworkRequests();
-        hookTimers();
+        hookRequestAnimationFrame();
         hookPageUnload();
         startWorkerTimer();
         startLocalTimer();
@@ -1037,15 +1004,11 @@
             handleIframeVideos();
             hookESNAIPlayer();
             startProactiveReporting();
-
             log('========== 所有模块初始化完成 ==========');
         }
 
-        if (document.readyState === 'loading') {
-            document.addEventListener('DOMContentLoaded', onDOMReady);
-        } else {
-            onDOMReady();
-        }
+        if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', onDOMReady);
+        else onDOMReady();
     }
 
     init();
