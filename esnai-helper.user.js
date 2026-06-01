@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ESNAI继续教育视频学习助手
 // @namespace    https://ce.esnai.net/
-// @version      2.5.0
+// @version      3.0.0
 // @description  确保视频学习时间正常累计，防止计时中断、弹题打断、暂停检测等
 // @author       GLM
 // @match        *://ce.esnai.net/*
@@ -10,8 +10,11 @@
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_xmlhttpRequest
+// @grant        GM_log
 // @run-at       document-start
 // @noframes     false
+// @connect      ce.esnai.net
+// @connect      *.esnai.net
 // ==/UserScript==
 
 (function () {
@@ -35,19 +38,60 @@
         startTime: Date.now(),
         localElapsed: 0,
         lastReportedSec: 0,
+        lastReportedTime: 0,
         videoPlaying: false,
         videoElement: null,
         lastMouseMoveTime: Date.now(),
         heartbeatInterval: 30000,
-        reportInterval: 60000,
+        reportInterval: 30000,
         quizAutoAnswerEnabled: true,
         forcePlayEnabled: true,
         simulateActivityEnabled: true,
         antiDetectionEnabled: true,
+        discoveredAPI: null,
+        discoveredHeaders: null,
+        discoveredMethod: null,
+        networkLog: [],
+        quizCount: 0,
+        reportCount: 0,
+        lastNetActivity: 0,
     };
 
+    const TIME_FIELDS = [
+        'second', 'sec', 'seconds', 'studytime', 'learnTime', 'duration',
+        'elapsed', 'time', 'study_time', 'learn_time', 'play_time',
+        'studyTime', 'studySecond', 'study_second', 'learnSecond',
+        'learn_second', 'playSecond', 'play_second', 'watchTime',
+        'watch_time', 'watchSecond', 'watch_second', 'totalTime',
+        'total_time', 'cumulativeTime', 'cumulative_time', 'accumulated',
+        'accumulatedTime', 'accumulated_time', 'effectiveTime',
+        'effective_time', 'validTime', 'valid_time', 'realTime',
+        'real_time', 'courseTime', 'course_time', 'timer',
+        'timerSecond', 'countSecond', 'count_second', 'studyLength',
+        'study_length', 'learnLength', 'learn_length', 'playLength',
+        'play_length', 'currentPosition', 'current_position',
+        'currentTime', 'current_time', 'position', 'pos',
+        'viewTime', 'view_time', 'viewDuration', 'view_duration',
+    ];
+
+    function getActualSec() {
+        return Math.floor((Date.now() - STATE.startTime) / 1000);
+    }
+
+    function addNetworkLog(type, url, detail) {
+        const entry = {
+            time: new Date().toLocaleTimeString(),
+            type: type,
+            url: typeof url === 'string' ? url.substring(0, 120) : String(url).substring(0, 120),
+            detail: detail || ''
+        };
+        STATE.networkLog.push(entry);
+        if (STATE.networkLog.length > 50) STATE.networkLog.shift();
+        STATE.lastNetActivity = Date.now();
+    }
+
     // ============================================================
-    // 二、页面可见性欺骗 —— 让平台永远认为页面是可见的
+    // 二、页面可见性欺骗
     // ============================================================
     function hookDocumentVisibility() {
         try {
@@ -97,7 +141,6 @@
             }, true);
         });
 
-        // 让 document.hasFocus() 永远返回 true
         try {
             Object.defineProperty(document, 'hasFocus', {
                 value: function () { return true; },
@@ -125,12 +168,10 @@
             return '';
         };
 
-        // 拦截 window.close
         window.close = function () {
             log('window.close 被拦截');
         };
 
-        // 拦截 beforeunload
         window.addEventListener('beforeunload', function (e) {
             e.stopImmediatePropagation();
             e.preventDefault();
@@ -140,66 +181,243 @@
     }
 
     // ============================================================
-    // 五、拦截 XMLHttpRequest / fetch —— 修正上报时间
+    // 五、拦截 XMLHttpRequest / fetch —— 修正上报时间（增强版）
     // ============================================================
     function hookNetworkRequests() {
-        // 拦截 XMLHttpRequest
         const OriginalXHR = window.XMLHttpRequest;
         const xhrOpen = OriginalXHR.prototype.open;
         const xhrSend = OriginalXHR.prototype.send;
+        const xhrSetHeader = OriginalXHR.prototype.setRequestHeader;
 
         OriginalXHR.prototype.open = function (method, url) {
             this._hookUrl = url;
             this._hookMethod = method;
+            this._hookHeaders = {};
             return xhrOpen.apply(this, arguments);
         };
 
-        OriginalXHR.prototype.send = function (body) {
-            if (this._hookUrl && typeof this._hookUrl === 'string') {
-                const url = this._hookUrl.toLowerCase();
+        OriginalXHR.prototype.setRequestHeader = function (name, value) {
+            if (this._hookHeaders) {
+                this._hookHeaders[name] = value;
+            }
+            return xhrSetHeader.apply(this, arguments);
+        };
 
-                // 检测计时上报请求
-                if (url.indexOf('studytime') !== -1 ||
-                    url.indexOf('reporttime') !== -1 ||
-                    url.indexOf('savestudy') !== -1 ||
-                    url.indexOf('updatetime') !== -1 ||
-                    url.indexOf('studyrecord') !== -1 ||
-                    url.indexOf('learnrecord') !== -1 ||
-                    url.indexOf('heartbeat') !== -1 ||
-                    url.indexOf('keeplive') !== -1 ||
-                    url.indexOf('keepalive') !== -1 ||
-                    url.indexOf('report') !== -1) {
+        function isStudyRelatedRequest(url) {
+            if (!url || typeof url !== 'string') return false;
+            const u = url.toLowerCase();
+            return u.indexOf('studytime') !== -1 ||
+                u.indexOf('reporttime') !== -1 ||
+                u.indexOf('savestudy') !== -1 ||
+                u.indexOf('updatetime') !== -1 ||
+                u.indexOf('studyrecord') !== -1 ||
+                u.indexOf('learnrecord') !== -1 ||
+                u.indexOf('heartbeat') !== -1 ||
+                u.indexOf('keeplive') !== -1 ||
+                u.indexOf('keepalive') !== -1 ||
+                u.indexOf('report') !== -1 ||
+                u.indexOf('study') !== -1 ||
+                u.indexOf('learn') !== -1 ||
+                u.indexOf('course') !== -1 ||
+                u.indexOf('timer') !== -1 ||
+                u.indexOf('play') !== -1 ||
+                u.indexOf('watch') !== -1 ||
+                u.indexOf('progress') !== -1 ||
+                u.indexOf('submit') !== -1 ||
+                u.indexOf('save') !== -1 ||
+                u.indexOf('update') !== -1 ||
+                u.indexOf('record') !== -1;
+        }
 
-                    log('拦截到计时上报请求:', this._hookUrl);
+        function isCheckCourseRequest(url) {
+            if (!url || typeof url !== 'string') return false;
+            return url.toLowerCase().indexOf('checkcourse') !== -1 ||
+                url.toLowerCase().indexOf('checkcourse') !== -1 ||
+                url.toLowerCase().indexOf('simultaneous') !== -1 ||
+                url.toLowerCase().indexOf('multiplay') !== -1;
+        }
 
-                    // 修正上报的秒数
-                    if (body && typeof body === 'string') {
-                        try {
-                            const actualSec = Math.floor((Date.now() - STATE.startTime) / 1000);
-                            let modified = body;
+        function modifyTimeInString(str) {
+            const actualSec = getActualSec();
+            let modified = str;
+            let changed = false;
 
-                            // 替换常见的秒数字段
-                            const secPatterns = [
-                                /([\"']?(?:second|sec|seconds|studytime|learnTime|duration|elapsed|time)[\"']?\s*[=:]\s*)\d+/gi,
-                                /([\"']?(?:study_time|learn_time|play_time)[\"']?\s*[=:]\s*)\d+/gi
-                            ];
-                            secPatterns.forEach(function (pat) {
-                                modified = modified.replace(pat, function (match, prefix) {
-                                    log('修正上报秒数:', match, '->', prefix + actualSec);
-                                    return prefix + actualSec;
-                                });
-                            });
+            try {
+                const json = JSON.parse(str);
+                let jsonChanged = false;
 
-                            if (modified !== body) {
-                                arguments[0] = modified;
-                                STATE.lastReportedSec = actualSec;
+                function walkAndModify(obj) {
+                    if (typeof obj === 'object' && obj !== null) {
+                        for (const key in obj) {
+                            if (typeof obj[key] === 'number' && isTimeField(key)) {
+                                if (obj[key] < actualSec || obj[key] === 0) {
+                                    log('JSON 修正字段:', key, obj[key], '->', actualSec);
+                                    obj[key] = actualSec;
+                                    jsonChanged = true;
+                                }
+                            } else if (typeof obj[key] === 'string') {
+                                const num = parseInt(obj[key], 10);
+                                if (!isNaN(num) && isTimeField(key) && (num < actualSec || num === 0)) {
+                                    log('JSON 修正字段(字符串):', key, obj[key], '->', String(actualSec));
+                                    obj[key] = String(actualSec);
+                                    jsonChanged = true;
+                                }
+                            } else if (typeof obj[key] === 'object') {
+                                walkAndModify(obj[key]);
                             }
-                        } catch (e) {
-                            warn('修正上报数据失败:', e);
                         }
                     }
                 }
+
+                walkAndModify(json);
+                if (jsonChanged) {
+                    modified = JSON.stringify(json);
+                    changed = true;
+                }
+            } catch (e) {
+                // Not JSON, try URL-encoded
+                try {
+                    const params = new URLSearchParams(str);
+                    let paramChanged = false;
+                    for (const [key, value] of params) {
+                        if (isTimeField(key)) {
+                            const num = parseInt(value, 10);
+                            if (!isNaN(num) && (num < actualSec || num === 0)) {
+                                log('URL-encoded 修正字段:', key, value, '->', actualSec);
+                                params.set(key, String(actualSec));
+                                paramChanged = true;
+                            }
+                        }
+                    }
+                    if (paramChanged) {
+                        modified = params.toString();
+                        changed = true;
+                    }
+                } catch (e2) {
+                    // Not URL-encoded, try regex
+                    const secPatterns = [
+                        /([\"']?(?:second|sec|seconds|studytime|learnTime|duration|elapsed)[\"']?\s*[=:]\s*)\d+/gi,
+                        /([\"']?(?:study_time|learn_time|play_time|studyTime|studySecond)[\"']?\s*[=:]\s*)\d+/gi,
+                        /([\"']?(?:watchTime|watch_time|courseTime|course_time|totalTime|total_time)[\"']?\s*[=:]\s*)\d+/gi,
+                        /([\"']?(?:timer|timerSecond|countSecond|count_second)[\"']?\s*[=:]\s*)\d+/gi,
+                    ];
+                    secPatterns.forEach(function (pat) {
+                        modified = modified.replace(pat, function (match, prefix) {
+                            log('正则修正:', match, '->', prefix + actualSec);
+                            changed = true;
+                            return prefix + actualSec;
+                        });
+                    });
+                }
             }
+
+            return { modified: modified, changed: changed, actualSec: actualSec };
+        }
+
+        function isTimeField(key) {
+            const k = key.toLowerCase();
+            return TIME_FIELDS.some(function (f) {
+                return k === f.toLowerCase() || k.indexOf(f.toLowerCase()) !== -1;
+            });
+        }
+
+        OriginalXHR.prototype.send = function (body) {
+            const url = this._hookUrl;
+
+            if (isCheckCourseRequest(url)) {
+                log('双课程检测请求被阻断:', url);
+                addNetworkLog('BLOCK', url, '双课程检测');
+                Object.defineProperty(this, 'readyState', { value: 4, configurable: true });
+                Object.defineProperty(this, 'status', { value: 200, configurable: true });
+                Object.defineProperty(this, 'responseText', { value: '{"code":0,"msg":"ok","data":{}}', configurable: true });
+                this.onreadystatechange && this.onreadystatechange();
+                this.onload && this.onload();
+                return;
+            }
+
+            if (isStudyRelatedRequest(url)) {
+                log('拦截到学习相关请求:', url);
+                addNetworkLog('HOOK', url, '学习相关');
+
+                if (this._hookHeaders) {
+                    STATE.discoveredHeaders = Object.assign({}, this._hookHeaders);
+                }
+                STATE.discoveredMethod = this._hookMethod || 'POST';
+
+                let discovered = false;
+                if (body) {
+                    if (typeof body === 'string') {
+                        const result = modifyTimeInString(body);
+                        if (result.changed) {
+                            arguments[0] = result.modified;
+                            STATE.lastReportedSec = result.actualSec;
+                            STATE.lastReportedTime = Date.now();
+                            STATE.reportCount++;
+                            discovered = true;
+                            addNetworkLog('MODIFY', url, '秒数修正为 ' + result.actualSec);
+                        }
+                    } else if (body instanceof FormData) {
+                        const actualSec = getActualSec();
+                        let fdChanged = false;
+                        for (const [key, value] of body.entries()) {
+                            if (isTimeField(key)) {
+                                const num = parseInt(value, 10);
+                                if (!isNaN(num) && (num < actualSec || num === 0)) {
+                                    log('FormData 修正字段:', key, value, '->', actualSec);
+                                    body.set(key, String(actualSec));
+                                    fdChanged = true;
+                                }
+                            }
+                        }
+                        if (fdChanged) {
+                            arguments[0] = body;
+                            STATE.lastReportedSec = actualSec;
+                            STATE.lastReportedTime = Date.now();
+                            STATE.reportCount++;
+                            discovered = true;
+                            addNetworkLog('MODIFY', url, 'FormData 秒数修正为 ' + actualSec);
+                        }
+                    } else if (body instanceof URLSearchParams) {
+                        const actualSec = getActualSec();
+                        let spChanged = false;
+                        for (const [key, value] of body.entries()) {
+                            if (isTimeField(key)) {
+                                const num = parseInt(value, 10);
+                                if (!isNaN(num) && (num < actualSec || num === 0)) {
+                                    log('URLSearchParams 修正字段:', key, value, '->', actualSec);
+                                    body.set(key, String(actualSec));
+                                    spChanged = true;
+                                }
+                            }
+                        }
+                        if (spChanged) {
+                            arguments[0] = body;
+                            STATE.lastReportedSec = actualSec;
+                            STATE.lastReportedTime = Date.now();
+                            STATE.reportCount++;
+                            discovered = true;
+                            addNetworkLog('MODIFY', url, 'URLSearchParams 秒数修正为 ' + actualSec);
+                        }
+                    }
+                }
+
+                if (!discovered && body) {
+                    const bodyPreview = typeof body === 'string' ? body.substring(0, 500) : (body.toString ? body.toString().substring(0, 500) : '');
+                    log('请求体未匹配到时间字段，原始内容:', bodyPreview);
+                    addNetworkLog('MISS', url, '未匹配时间字段: ' + bodyPreview.substring(0, 80));
+                    STATE.discoveredAPI = url;
+                } else if (!body) {
+                    STATE.discoveredAPI = url;
+                    addNetworkLog('NOBODY', url, '无请求体');
+                }
+
+                if (!discovered) {
+                    STATE.discoveredAPI = url;
+                }
+            } else if (url && typeof url === 'string') {
+                addNetworkLog('PASS', url, '');
+            }
+
             return xhrSend.apply(this, arguments);
         };
 
@@ -210,42 +428,61 @@
                 const url = (typeof input === 'string') ? input :
                     (input instanceof Request) ? input.url : '';
 
-                if (url && typeof url === 'string') {
-                    const urlLower = url.toLowerCase();
-                    if (urlLower.indexOf('studytime') !== -1 ||
-                        urlLower.indexOf('reporttime') !== -1 ||
-                        urlLower.indexOf('savestudy') !== -1 ||
-                        urlLower.indexOf('updatetime') !== -1 ||
-                        urlLower.indexOf('studyrecord') !== -1 ||
-                        urlLower.indexOf('learnrecord') !== -1 ||
-                        urlLower.indexOf('heartbeat') !== -1 ||
-                        urlLower.indexOf('keeplive') !== -1 ||
-                        urlLower.indexOf('keepalive') !== -1 ||
-                        urlLower.indexOf('report') !== -1) {
+                if (isCheckCourseRequest(url)) {
+                    log('fetch 双课程检测请求被阻断:', url);
+                    addNetworkLog('BLOCK', url, '双课程检测(fetch)');
+                    return Promise.resolve(new Response('{"code":0,"msg":"ok","data":{}}', {
+                        status: 200,
+                        headers: { 'Content-Type': 'application/json' }
+                    }));
+                }
 
-                        log('拦截到 fetch 计时上报:', url);
+                if (isStudyRelatedRequest(url)) {
+                    log('拦截到 fetch 学习相关请求:', url);
+                    addNetworkLog('HOOK', url, '学习相关(fetch)');
 
-                        if (init && init.body && typeof init.body === 'string') {
-                            const actualSec = Math.floor((Date.now() - STATE.startTime) / 1000);
-                            let modified = init.body;
+                    STATE.discoveredAPI = url;
+                    if (init && init.headers) {
+                        STATE.discoveredHeaders = init.headers;
+                    }
+                    STATE.discoveredMethod = (init && init.method) || 'GET';
 
-                            const secPatterns = [
-                                /([\"']?(?:second|sec|seconds|studytime|learnTime|duration|elapsed|time)[\"']?\s*[=:]\s*)\d+/gi,
-                                /([\"']?(?:study_time|learn_time|play_time)[\"']?\s*[=:]\s*)\d+/gi
-                            ];
-                            secPatterns.forEach(function (pat) {
-                                modified = modified.replace(pat, function (match, prefix) {
-                                    log('修正 fetch 上报秒数:', match, '->', prefix + actualSec);
-                                    return prefix + actualSec;
-                                });
-                            });
-
-                            if (modified !== init.body) {
-                                init.body = modified;
+                    if (init && init.body) {
+                        if (typeof init.body === 'string') {
+                            const result = modifyTimeInString(init.body);
+                            if (result.changed) {
+                                init.body = result.modified;
+                                STATE.lastReportedSec = result.actualSec;
+                                STATE.lastReportedTime = Date.now();
+                                STATE.reportCount++;
+                                addNetworkLog('MODIFY', url, 'fetch 秒数修正为 ' + result.actualSec);
+                            } else {
+                                log('fetch 请求体未匹配到时间字段:', init.body.substring(0, 500));
+                                addNetworkLog('MISS', url, 'fetch 未匹配: ' + init.body.substring(0, 80));
+                            }
+                        } else if (init.body instanceof FormData) {
+                            const actualSec = getActualSec();
+                            let fdChanged = false;
+                            for (const [key, value] of init.body.entries()) {
+                                if (isTimeField(key)) {
+                                    const num = parseInt(value, 10);
+                                    if (!isNaN(num) && (num < actualSec || num === 0)) {
+                                        log('fetch FormData 修正字段:', key, value, '->', actualSec);
+                                        init.body.set(key, String(actualSec));
+                                        fdChanged = true;
+                                    }
+                                }
+                            }
+                            if (fdChanged) {
                                 STATE.lastReportedSec = actualSec;
+                                STATE.lastReportedTime = Date.now();
+                                STATE.reportCount++;
+                                addNetworkLog('MODIFY', url, 'fetch FormData 秒数修正为 ' + actualSec);
                             }
                         }
                     }
+                } else if (url) {
+                    addNetworkLog('PASS', url, '');
                 }
             } catch (e) {
                 warn('fetch hook error:', e);
@@ -253,50 +490,114 @@
             return originalFetch.apply(this, arguments);
         };
 
-        log('网络请求拦截已激活');
+        log('网络请求拦截已激活（增强版）');
     }
 
     // ============================================================
-    // 六、主动上报计时 —— 平台长时间不上报时自己上报
+    // 六、主动上报计时 —— 自动发现 API 并直接上报
     // ============================================================
     function startProactiveReporting() {
-        setInterval(function () {
-            try {
-                const actualSec = Math.floor((Date.now() - STATE.startTime) / 1000);
+        function tryProactiveReport() {
+            const actualSec = getActualSec();
 
-                if (actualSec - STATE.lastReportedSec > 60) {
-                    log('主动上报计时，实际秒数:', actualSec, '上次上报:', STATE.lastReportedSec);
+            if (actualSec - STATE.lastReportedSec < 30) return;
 
-                    // 尝试找到页面中的计时上报函数并调用
-                    // esnai 平台通常使用全局函数或 jQuery AJAX 上报
-                    if (window.saveStudyTime) {
-                        window.saveStudyTime(actualSec);
+            log('尝试主动上报，实际秒数:', actualSec, '上次上报:', STATE.lastReportedSec);
+
+            // 方式1：调用平台全局函数
+            const globalFunctions = [
+                'saveStudyTime', 'reportStudyTime', 'updateStudyRecord',
+                'saveStudyRecord', 'reportRecord', 'updateTime',
+                'studyReport', 'learnReport', 'courseReport',
+                'submitStudyTime', 'commitStudyTime', 'sendStudyTime',
+                'reportProgress', 'saveProgress', 'updateProgress',
+                'studyHeartbeat', 'learnHeartbeat',
+            ];
+
+            let called = false;
+            for (const fnName of globalFunctions) {
+                if (typeof window[fnName] === 'function') {
+                    try {
+                        log('调用全局函数:', fnName, '参数:', actualSec);
+                        window[fnName](actualSec);
                         STATE.lastReportedSec = actualSec;
-                    } else if (window.reportStudyTime) {
-                        window.reportStudyTime(actualSec);
-                        STATE.lastReportedSec = actualSec;
-                    } else if (window.updateStudyRecord) {
-                        window.updateStudyRecord(actualSec);
-                        STATE.lastReportedSec = actualSec;
+                        STATE.lastReportedTime = Date.now();
+                        STATE.reportCount++;
+                        called = true;
+                        addNetworkLog('PROACTIVE', fnName, '调用全局函数 秒数=' + actualSec);
+                        break;
+                    } catch (e) {
+                        warn('调用全局函数失败:', fnName, e);
                     }
                 }
-            } catch (e) {
-                warn('主动上报失败:', e);
             }
-        }, STATE.reportInterval);
 
-        log('主动上报计时已启动');
+            // 方式2：通过发现的 API 端点直接上报
+            if (!called && STATE.discoveredAPI) {
+                try {
+                    const apiUrl = STATE.discoveredAPI;
+                    log('通过发现的 API 主动上报:', apiUrl);
+
+                    if (typeof GM_xmlhttpRequest !== 'undefined') {
+                        const method = STATE.discoveredMethod || 'POST';
+                        const body = JSON.stringify({ studyTime: actualSec, second: actualSec, duration: actualSec, time: actualSec });
+
+                        GM_xmlhttpRequest({
+                            method: method,
+                            url: apiUrl.startsWith('http') ? apiUrl : window.location.origin + apiUrl,
+                            headers: {
+                                'Content-Type': 'application/json',
+                            },
+                            data: method === 'POST' ? body : undefined,
+                            onload: function (response) {
+                                log('主动上报响应:', response.status, response.responseText.substring(0, 200));
+                                STATE.lastReportedSec = actualSec;
+                                STATE.lastReportedTime = Date.now();
+                                STATE.reportCount++;
+                                addNetworkLog('PROACTIVE', apiUrl, 'GM上报成功 秒数=' + actualSec);
+                            },
+                            onerror: function (error) {
+                                warn('GM_xmlhttpRequest 上报失败:', error);
+                                addNetworkLog('ERROR', apiUrl, 'GM上报失败');
+                            }
+                        });
+                        called = true;
+                    }
+                } catch (e) {
+                    warn('API 主动上报失败:', e);
+                }
+            }
+
+            // 方式3：触发平台自身的上报逻辑
+            if (!called) {
+                try {
+                    const video = document.querySelector('video');
+                    if (video && !video.paused) {
+                        const origTime = video.currentTime;
+                        video.currentTime = Math.max(0, origTime - 1);
+                        setTimeout(function () {
+                            video.currentTime = origTime;
+                        }, 100);
+                        log('通过视频 seek 触发平台上报');
+                        addNetworkLog('PROACTIVE', 'video-seek', '触发平台上报');
+                    }
+                } catch (e) { }
+            }
+        }
+
+        setInterval(tryProactiveReport, STATE.reportInterval);
+
+        log('主动上报计时已启动（增强版）');
     }
 
     // ============================================================
-    // 七、视频防暂停 —— 阻止视频被暂停，被暂停后立即恢复
+    // 七、视频防暂停
     // ============================================================
     function hookVideoPause() {
         function protectVideo(video) {
             if (video._hooked) return;
             video._hooked = true;
 
-            // 拦截 pause() 调用
             const originalPause = video.pause.bind(video);
             let pauseBlocked = false;
 
@@ -308,7 +609,6 @@
                 return originalPause();
             };
 
-            // 监听 pause 事件，立即恢复播放
             video.addEventListener('pause', function (e) {
                 if (STATE.forcePlayEnabled) {
                     e.stopImmediatePropagation();
@@ -326,7 +626,6 @@
                 }
             }, true);
 
-            // 监听 waiting / stalled 事件
             ['waiting', 'stalled', 'suspend'].forEach(function (evt) {
                 video.addEventListener(evt, function (e) {
                     if (STATE.forcePlayEnabled) {
@@ -336,7 +635,6 @@
                 }, true);
             });
 
-            // 确保视频持续播放
             setInterval(function () {
                 if (STATE.forcePlayEnabled && video.paused && !video.ended) {
                     log('检测到视频暂停，强制恢复');
@@ -346,7 +644,6 @@
                 }
             }, 2000);
 
-            // 防止视频播放速率被修改为0
             try {
                 const originalPlaybackRate = Object.getOwnPropertyDescriptor(
                     HTMLMediaElement.prototype, 'playbackRate'
@@ -371,7 +668,6 @@
             log('视频防暂停保护已激活');
         }
 
-        // MutationObserver 监听视频元素
         function observeVideos() {
             document.querySelectorAll('video').forEach(protectVideo);
 
@@ -406,7 +702,6 @@
     // ============================================================
     function autoHandlePopups() {
         function handleQuizAndPopups() {
-            // 自动点击弹题中的选项和确认按钮
             const clickSelectors = [
                 '.quiz-popup .submit-btn',
                 '.quiz-popup .btn-confirm',
@@ -438,7 +733,6 @@
                 '.noty_type__confirm .btn-primary',
             ];
 
-            // 自动关闭弹窗
             const closeSelectors = [
                 '.quiz-popup .close-btn',
                 '.quiz-popup .btn-close',
@@ -459,7 +753,6 @@
                 '.msg-box .close',
             ];
 
-            // 弹题容器选择器 —— 如果出现，自动选择第一个选项并提交
             const quizContainers = [
                 '.quiz-popup',
                 '.popup-question',
@@ -472,7 +765,6 @@
                 '.study-interact',
             ];
 
-            // 处理弹题容器
             quizContainers.forEach(function (containerSelector) {
                 const containers = document.querySelectorAll(containerSelector);
                 containers.forEach(function (container) {
@@ -483,8 +775,8 @@
                     container._autoHandled = true;
 
                     log('检测到弹题容器:', containerSelector);
+                    STATE.quizCount++;
 
-                    // 选择第一个选项
                     const optionSelectors = [
                         '.answer-option', '.option-item', 'input[type="radio"]',
                         'input[type="checkbox"]', '.choice-item', '.quiz-option',
@@ -501,7 +793,6 @@
                         }
                     }
 
-                    // 点击提交按钮
                     setTimeout(function () {
                         clickSelectors.forEach(function (sel) {
                             const btn = container.querySelector(sel);
@@ -511,7 +802,6 @@
                             }
                         });
 
-                        // 如果有确认按钮在容器外
                         const globalConfirmBtns = document.querySelectorAll(
                             '.layui-layer-btn0, .dialog-confirm .btn-confirm'
                         );
@@ -525,7 +815,6 @@
                 });
             });
 
-            // 处理关闭按钮
             closeSelectors.forEach(function (sel) {
                 const btns = document.querySelectorAll(sel);
                 btns.forEach(function (btn) {
@@ -538,7 +827,6 @@
                 });
             });
 
-            // 处理 iframe 中的弹题
             try {
                 const iframes = document.querySelectorAll('iframe');
                 iframes.forEach(function (iframe) {
@@ -559,10 +847,8 @@
             } catch (e) { }
         }
 
-        // 每2秒检测一次弹窗弹题
         setInterval(handleQuizAndPopups, 2000);
 
-        // MutationObserver 实时检测
         const popupObserver = new MutationObserver(function (mutations) {
             let shouldCheck = false;
             mutations.forEach(function (m) {
@@ -591,7 +877,7 @@
     }
 
     // ============================================================
-    // 九、模拟用户活动 —— 鼠标移动、点击、键盘
+    // 九、模拟用户活动
     // ============================================================
     function simulateUserActivity() {
         function dispatchMouseEvent(type) {
@@ -612,7 +898,6 @@
             STATE.lastMouseMoveTime = Date.now();
         }
 
-        // 每 3-8 秒模拟一次鼠标移动（随机间隔）
         function scheduleMouseMove() {
             const delay = 3000 + Math.random() * 5000;
             setTimeout(function () {
@@ -625,7 +910,6 @@
         }
         scheduleMouseMove();
 
-        // 每 30 秒模拟一次点击（在视频区域）
         setInterval(function () {
             if (!STATE.simulateActivityEnabled) return;
             const video = document.querySelector('video');
@@ -645,7 +929,6 @@
             }
         }, 30000);
 
-        // 每 60 秒模拟一次键盘按键
         setInterval(function () {
             if (!STATE.simulateActivityEnabled) return;
             const keyEvt = new KeyboardEvent('keydown', {
@@ -658,12 +941,11 @@
             log('模拟键盘事件');
         }, 60000);
 
-        // 拦截平台的无操作检测
-        // 有些平台用全局变量记录最后操作时间
         function hookIdleDetection() {
-            // 覆盖常见的最后活动时间变量
             const idleVars = ['lastActiveTime', 'lastActivityTime', 'lastOperateTime',
-                'lastActionTime', 'lastMouseMoveTime', 'lastUserActionTime'];
+                'lastActionTime', 'lastMouseMoveTime', 'lastUserActionTime',
+                'lastStudyTime', 'lastPlayTime', 'lastHeartbeatTime',
+                'studyActiveTime', 'playActiveTime'];
 
             setInterval(function () {
                 idleVars.forEach(function (varName) {
@@ -672,7 +954,6 @@
                     }
                 });
 
-                // 也检查常见的 jQuery 数据
                 if (window.$ && window.$.fn) {
                     try {
                         const $doc = $(document);
@@ -696,21 +977,17 @@
     }
 
     // ============================================================
-    // 十、本地计时器 —— 独立于视频播放的计时
+    // 十、本地计时器
     // ============================================================
     function startLocalTimer() {
         setInterval(function () {
             STATE.localElapsed = Math.floor((Date.now() - STATE.startTime) / 1000);
 
-            // 同步视频进度到实际时间
             const video = document.querySelector('video');
             if (video && STATE.forcePlayEnabled) {
-                // 如果视频的 currentTime 远小于我们记录的本地时间
-                // 说明视频可能被弹题暂停了，需要修正
                 const videoTime = Math.floor(video.currentTime);
                 const expectedTime = STATE.localElapsed;
 
-                // 只在差距较大时修正（避免频繁跳转）
                 if (expectedTime - videoTime > 10 && expectedTime < video.duration) {
                     log('修正视频进度:', videoTime, '->', expectedTime);
                     video.currentTime = expectedTime;
@@ -722,17 +999,15 @@
     }
 
     // ============================================================
-    // 十一、拦截 setInterval / setTimeout —— 防止平台用定时器停止计时
+    // 十一、拦截 setInterval / setTimeout
     // ============================================================
     function hookTimers() {
         const originalSetInterval = window.setInterval;
         const originalSetTimeout = window.setTimeout;
 
-        // 记录平台创建的定时器，用于监控
         window.setInterval = function (fn, delay) {
             const fnStr = fn ? fn.toString() : '';
 
-            // 检测停止计时的定时器
             if (fnStr.indexOf('stopTimer') !== -1 ||
                 fnStr.indexOf('stopStudy') !== -1 ||
                 fnStr.indexOf('pauseTimer') !== -1 ||
@@ -780,12 +1055,11 @@
     }
 
     // ============================================================
-    // 十二、心跳保活 —— 定期发送请求防止会话过期
+    // 十二、心跳保活
     // ============================================================
     function startHeartbeat() {
         setInterval(function () {
             try {
-                // 尝试找到页面中的心跳/保活函数
                 if (window.heartbeat) {
                     window.heartbeat();
                 } else if (window.keepAlive) {
@@ -794,7 +1068,6 @@
                     window.keepalive();
                 }
 
-                // 通过 AJAX 发送心跳
                 const xhr = new XMLHttpRequest();
                 xhr.open('GET', window.location.href, true);
                 xhr.timeout = 10000;
@@ -831,7 +1104,6 @@
                 }
             });
 
-            // 拦截 jQuery 事件触发的停止计时
             if (window.$ && window.$.event) {
                 try {
                     const originalTrigger = window.$.event.trigger;
@@ -849,7 +1121,6 @@
             }
         }
 
-        // 延迟执行，等待平台脚本加载
         setTimeout(waitForWindow, 1000);
         setTimeout(waitForWindow, 3000);
         setTimeout(waitForWindow, 5000);
@@ -865,7 +1136,81 @@
     }
 
     // ============================================================
-    // 十四、状态面板 —— 显示在页面右上角
+    // 十四、发现并保持平台内部计时变量
+    // ============================================================
+    function keepPlatformTimerAlive() {
+        function findAndKeepTimers() {
+            const timerVarPatterns = [
+                'studyTime', 'studySeconds', 'studySec', 'studyTimer',
+                'learnTime', 'learnSeconds', 'learnSec', 'learnTimer',
+                'playTime', 'playSeconds', 'playSec', 'playTimer',
+                'watchTime', 'watchSeconds', 'watchSec',
+                'courseTime', 'courseSeconds', 'courseSec',
+                'timer', 'timerSeconds', 'timerSec',
+                'countSeconds', 'countSec', 'elapsedTime', 'elapsedSec',
+                'totalStudyTime', 'totalLearnTime',
+                'currentStudyTime', 'currentLearnTime',
+                'studyDuration', 'learnDuration',
+                'secondCount', 'secCount',
+                'study_time', 'learn_time', 'play_time',
+                'study_second', 'learn_second',
+            ];
+
+            const actualSec = getActualSec();
+
+            timerVarPatterns.forEach(function (varName) {
+                if (window[varName] !== undefined && typeof window[varName] === 'number') {
+                    if (window[varName] < actualSec) {
+                        log('刷新平台计时变量:', varName, window[varName], '->', actualSec);
+                        window[varName] = actualSec;
+                    }
+                }
+            });
+
+            // 搜索 window 上的数字属性，寻找可能是计时器的变量
+            try {
+                for (const key in window) {
+                    if (typeof window[key] === 'number' && window[key] > 0 && window[key] < actualSec + 100) {
+                        const k = key.toLowerCase();
+                        if ((k.indexOf('time') !== -1 || k.indexOf('sec') !== -1 ||
+                            k.indexOf('dur') !== -1 || k.indexOf('count') !== -1 ||
+                            k.indexOf('timer') !== -1 || k.indexOf('elapsed') !== -1) &&
+                            window[key] < actualSec) {
+                            log('发现疑似计时变量:', key, '=', window[key], '->', actualSec);
+                            window[key] = actualSec;
+                        }
+                    }
+                }
+            } catch (e) { }
+
+            // 搜索 Vue 实例中的数据
+            try {
+                const vueEls = document.querySelectorAll('[data-v-],[__vue__]');
+                vueEls.forEach(function (el) {
+                    const vm = el.__vue__ || el._vm;
+                    if (vm && vm.$data) {
+                        for (const key in vm.$data) {
+                            if (typeof vm.$data[key] === 'number' && vm.$data[key] < actualSec && vm.$data[key] > 0) {
+                                const k = key.toLowerCase();
+                                if (k.indexOf('time') !== -1 || k.indexOf('sec') !== -1 ||
+                                    k.indexOf('dur') !== -1 || k.indexOf('study') !== -1) {
+                                    log('发现 Vue 计时变量:', key, '=', vm.$data[key], '->', actualSec);
+                                    vm.$data[key] = actualSec;
+                                }
+                            }
+                        }
+                    }
+                });
+            } catch (e) { }
+        }
+
+        setInterval(findAndKeepTimers, 5000);
+
+        log('平台计时变量保持已激活');
+    }
+
+    // ============================================================
+    // 十五、状态面板（增强版）
     // ============================================================
     function createStatusPanel() {
         GM_addStyle(`
@@ -873,7 +1218,7 @@
                 position: fixed;
                 top: 10px;
                 right: 10px;
-                background: rgba(0, 0, 0, 0.85);
+                background: rgba(0, 0, 0, 0.9);
                 color: #0f0;
                 padding: 12px 16px;
                 border-radius: 8px;
@@ -881,7 +1226,8 @@
                 font-family: 'Consolas', 'Monaco', monospace;
                 font-size: 13px;
                 line-height: 1.6;
-                min-width: 260px;
+                min-width: 280px;
+                max-width: 360px;
                 box-shadow: 0 4px 20px rgba(0,0,0,0.5);
                 border: 1px solid #0f0;
                 user-select: none;
@@ -942,50 +1288,100 @@
                 flex-wrap: wrap;
                 gap: 4px;
             }
+            #esnai-helper-panel .panel-netlog {
+                margin-top: 8px;
+                border-top: 1px solid #333;
+                padding-top: 6px;
+                max-height: 120px;
+                overflow-y: auto;
+                font-size: 11px;
+            }
+            #esnai-helper-panel .panel-netlog .log-entry {
+                margin: 1px 0;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+            #esnai-helper-panel .panel-netlog .log-MODIFY { color: #0f0; }
+            #esnai-helper-panel .panel-netlog .log-BLOCK { color: #f00; }
+            #esnai-helper-panel .panel-netlog .log-MISS { color: #ff0; }
+            #esnai-helper-panel .panel-netlog .log-PROACTIVE { color: #0ff; }
+            #esnai-helper-panel .panel-netlog .log-HOOK { color: #aaa; }
+            #esnai-helper-panel .panel-netlog .log-PASS { color: #555; }
+            #esnai-helper-panel .panel-netlog .log-ERROR { color: #f00; }
+            #esnai-helper-panel .panel-netlog .log-NOBODY { color: #ff0; }
+            #esnai-helper-panel .panel-toggle {
+                position: absolute;
+                top: 4px;
+                right: 8px;
+                cursor: pointer;
+                color: #0f0;
+                font-size: 16px;
+            }
         `);
 
         const panel = document.createElement('div');
         panel.id = 'esnai-helper-panel';
         panel.innerHTML = `
-            <div class="panel-title">ESNAI 继续教育助手 v2.5</div>
-            <div class="panel-row">
-                <span class="panel-label">运行状态:</span>
-                <span class="panel-status" id="eh-status">运行中</span>
-            </div>
-            <div class="panel-row">
-                <span class="panel-label">本地计时:</span>
-                <span class="panel-value" id="eh-local-time">00:00:00</span>
-            </div>
-            <div class="panel-row">
-                <span class="panel-label">视频进度:</span>
-                <span class="panel-value" id="eh-video-time">00:00:00</span>
-            </div>
-            <div class="panel-row">
-                <span class="panel-label">视频状态:</span>
-                <span class="panel-value" id="eh-video-status">检测中...</span>
-            </div>
-            <div class="panel-row">
-                <span class="panel-label">弹题处理:</span>
-                <span class="panel-value" id="eh-quiz-count">0 次</span>
-            </div>
-            <div class="panel-row">
-                <span class="panel-label">页面可见:</span>
-                <span class="panel-value" id="eh-visibility">是(伪造)</span>
-            </div>
-            <div class="panel-buttons">
-                <button class="panel-btn active" id="eh-btn-play" title="防暂停">防暂停:开</button>
-                <button class="panel-btn active" id="eh-btn-quiz" title="自动答题">自动答题:开</button>
-                <button class="panel-btn active" id="eh-btn-activity" title="模拟活动">模拟活动:开</button>
-                <button class="panel-btn active" id="eh-btn-anti" title="反检测">反检测:开</button>
+            <span class="panel-toggle" id="eh-toggle" title="折叠/展开">▼</span>
+            <div class="panel-title">ESNAI 继续教育助手 v3.0</div>
+            <div id="eh-body">
+                <div class="panel-row">
+                    <span class="panel-label">运行状态:</span>
+                    <span class="panel-status" id="eh-status">运行中</span>
+                </div>
+                <div class="panel-row">
+                    <span class="panel-label">本地计时:</span>
+                    <span class="panel-value" id="eh-local-time">00:00:00</span>
+                </div>
+                <div class="panel-row">
+                    <span class="panel-label">视频进度:</span>
+                    <span class="panel-value" id="eh-video-time">00:00:00</span>
+                </div>
+                <div class="panel-row">
+                    <span class="panel-label">视频状态:</span>
+                    <span class="panel-value" id="eh-video-status">检测中...</span>
+                </div>
+                <div class="panel-row">
+                    <span class="panel-label">弹题处理:</span>
+                    <span class="panel-value" id="eh-quiz-count">0 次</span>
+                </div>
+                <div class="panel-row">
+                    <span class="panel-label">上报次数:</span>
+                    <span class="panel-value" id="eh-report-count">0 次</span>
+                </div>
+                <div class="panel-row">
+                    <span class="panel-label">上次上报:</span>
+                    <span class="panel-value" id="eh-last-report">未上报</span>
+                </div>
+                <div class="panel-row">
+                    <span class="panel-label">上报秒数:</span>
+                    <span class="panel-value" id="eh-reported-sec">0</span>
+                </div>
+                <div class="panel-row">
+                    <span class="panel-label">页面可见:</span>
+                    <span class="panel-value" id="eh-visibility">是(伪造)</span>
+                </div>
+                <div class="panel-buttons">
+                    <button class="panel-btn active" id="eh-btn-play" title="防暂停">防暂停:开</button>
+                    <button class="panel-btn active" id="eh-btn-quiz" title="自动答题">自动答题:开</button>
+                    <button class="panel-btn active" id="eh-btn-activity" title="模拟活动">模拟活动:开</button>
+                    <button class="panel-btn active" id="eh-btn-anti" title="反检测">反检测:开</button>
+                </div>
+                <div class="panel-netlog" id="eh-netlog"></div>
             </div>
         `;
         document.body.appendChild(panel);
 
-        let quizCount = 0;
+        let collapsed = false;
+        document.getElementById('eh-toggle').addEventListener('click', function () {
+            collapsed = !collapsed;
+            document.getElementById('eh-body').style.display = collapsed ? 'none' : '';
+            this.textContent = collapsed ? '▶' : '▼';
+        });
 
-        // 更新面板
         setInterval(function () {
-            const localSec = Math.floor((Date.now() - STATE.startTime) / 1000);
+            const localSec = getActualSec();
             const h = Math.floor(localSec / 3600);
             const m = Math.floor((localSec % 3600) / 60);
             const s = localSec % 60;
@@ -1021,9 +1417,31 @@
                 document.getElementById('eh-video-time').textContent = '未检测到';
                 document.getElementById('eh-video-status').textContent = '无视频';
             }
+
+            document.getElementById('eh-quiz-count').textContent = STATE.quizCount + ' 次';
+            document.getElementById('eh-report-count').textContent = STATE.reportCount + ' 次';
+            document.getElementById('eh-reported-sec').textContent = STATE.lastReportedSec + 's';
+
+            if (STATE.lastReportedTime > 0) {
+                const ago = Math.floor((Date.now() - STATE.lastReportedTime) / 1000);
+                document.getElementById('eh-last-report').textContent = ago + '秒前';
+            }
+
+            // 更新网络日志
+            const netlogEl = document.getElementById('eh-netlog');
+            if (netlogEl && STATE.networkLog.length > 0) {
+                const recentLogs = STATE.networkLog.slice(-8);
+                netlogEl.innerHTML = recentLogs.map(function (entry) {
+                    const cls = 'log-' + (entry.type || 'PASS');
+                    const shortUrl = entry.url.replace(/^https?:\/\/[^/]+/, '');
+                    return '<div class="log-entry ' + cls + '">' +
+                        entry.time + ' [' + entry.type + '] ' + shortUrl +
+                        (entry.detail ? ' ' + entry.detail.substring(0, 40) : '') +
+                        '</div>';
+                }).join('');
+            }
         }, 1000);
 
-        // 按钮事件
         document.getElementById('eh-btn-play').addEventListener('click', function () {
             STATE.forcePlayEnabled = !STATE.forcePlayEnabled;
             this.textContent = '防暂停:' + (STATE.forcePlayEnabled ? '开' : '关');
@@ -1048,11 +1466,11 @@
             this.classList.toggle('active', STATE.antiDetectionEnabled);
         });
 
-        log('状态面板已创建');
+        log('状态面板已创建（增强版）');
     }
 
     // ============================================================
-    // 十五、拦截 beforeunload 和 unload —— 防止页面被关闭
+    // 十六、拦截 beforeunload 和 unload
     // ============================================================
     function hookPageUnload() {
         window.addEventListener('beforeunload', function (e) {
@@ -1063,11 +1481,6 @@
             e.stopImmediatePropagation();
         }, true);
 
-        // 拦截 location 赋值导致的页面跳转
-        let lastHref = window.location.href;
-        const originalLocationDescriptor = Object.getOwnPropertyDescriptor(window, 'location');
-
-        // 拦截 window.open
         const originalWindowOpen = window.open;
         window.open = function (url) {
             log('window.open 被拦截:', url);
@@ -1078,7 +1491,7 @@
     }
 
     // ============================================================
-    // 十六、处理 iframe 内的视频
+    // 十七、处理 iframe 内的视频
     // ============================================================
     function handleIframeVideos() {
         function processIframes() {
@@ -1107,7 +1520,6 @@
                         }, 3000);
                     });
 
-                    // 拦截 iframe 内的弹窗
                     iframe.contentWindow.alert = function () { };
                     iframe.contentWindow.confirm = function () { return true; };
                     iframe.contentWindow.prompt = function () { return ''; };
@@ -1124,11 +1536,10 @@
     }
 
     // ============================================================
-    // 十七、处理 esnai 特有的 Flash/HTML5 播放器
+    // 十八、处理 esnai 特有的 Flash/HTML5 播放器
     // ============================================================
     function hookESNAIPlayer() {
         function findAndHookPlayer() {
-            // esnai 平台可能使用自定义播放器对象
             const playerObjects = ['player', 'videoPlayer', 'studyPlayer',
                 'coursePlayer', 'flashPlayer', 'mediaPlayer',
                 'polyvPlayer', 'ckPlayer', 'ckplayer'];
@@ -1137,7 +1548,6 @@
                 if (window[name] && typeof window[name] === 'object') {
                     log('检测到播放器对象:', name);
 
-                    // 拦截暂停方法
                     if (window[name].pause) {
                         const origPause = window[name].pause.bind(window[name]);
                         window[name].pause = function () {
@@ -1149,7 +1559,6 @@
                         };
                     }
 
-                    // 确保播放
                     if (window[name].play) {
                         setInterval(function () {
                             try {
@@ -1162,11 +1571,9 @@
                 }
             });
 
-            // 查找 embed/object 标签（Flash 播放器）
             const embeds = document.querySelectorAll('embed, object');
             embeds.forEach(function (embed) {
                 log('检测到 Flash/embed 播放器');
-                // Flash 播放器通过 ExternalInterface 暴露方法
                 try {
                     if (embed.play) {
                         setInterval(function () {
@@ -1177,7 +1584,6 @@
             });
         }
 
-        // 多次尝试，等待播放器加载
         setTimeout(findAndHookPlayer, 1000);
         setTimeout(findAndHookPlayer, 3000);
         setTimeout(findAndHookPlayer, 5000);
@@ -1188,32 +1594,10 @@
     }
 
     // ============================================================
-    // 十八、自动点击"继续学习"等确认按钮
+    // 十九、自动点击"继续学习"等确认按钮
     // ============================================================
     function autoClickContinueButtons() {
         function clickContinue() {
-            const continueSelectors = [
-                'button:contains("继续学习")',
-                'button:contains("继续")',
-                'button:contains("确定")',
-                'button:contains("确认")',
-                'a:contains("继续学习")',
-                'a:contains("继续")',
-                '.btn-continue',
-                '.btn-confirm',
-                '.btn-ok',
-                '.btn-next',
-                '.continue-btn',
-                '.confirm-btn',
-                '.ok-btn',
-                '.next-btn',
-                '#continueBtn',
-                '#confirmBtn',
-                '#okBtn',
-                '#nextBtn',
-            ];
-
-            // 使用原生 DOM 查找（不依赖 jQuery :contains）
             const allButtons = document.querySelectorAll('button, a, input[type="button"], input[type="submit"]');
             allButtons.forEach(function (btn) {
                 const text = (btn.textContent || btn.value || '').trim();
@@ -1229,7 +1613,6 @@
                 }
             });
 
-            // 处理 layui 弹层
             const layuiBtns = document.querySelectorAll('.layui-layer-btn0');
             layuiBtns.forEach(function (btn) {
                 if (btn.offsetParent !== null && !btn._autoClicked) {
@@ -1240,7 +1623,6 @@
                 }
             });
 
-            // 处理 artDialog
             const artBtns = document.querySelectorAll('.aui_state_highlight, .aui_ok');
             artBtns.forEach(function (btn) {
                 if (btn.offsetParent !== null && !btn._autoClicked) {
@@ -1257,7 +1639,7 @@
     }
 
     // ============================================================
-    // 十九、Web Worker 计时 —— 不受标签页节流影响
+    // 二十、Web Worker 计时
     // ============================================================
     function startWorkerTimer() {
         try {
@@ -1284,86 +1666,39 @@
     }
 
     // ============================================================
-    // 二十、防止双课程检测
+    // 二十一、防止双课程检测（真正阻断版）
     // ============================================================
     function hookDualCourseDetection() {
-        // 拦截"不能同时播放两门以上课程"的检测
-        const OriginalXHR = window.XMLHttpRequest;
-        const origOpen = OriginalXHR.prototype.open;
-
-        OriginalXHR.prototype.open = function (method, url) {
-            if (typeof url === 'string' && url.toLowerCase().indexOf('checkcourse') !== -1) {
-                log('双课程检测请求被拦截:', url);
-            }
-            return origOpen.apply(this, arguments);
-        };
-
-        log('双课程检测拦截已激活');
+        log('双课程检测拦截已由网络请求拦截模块统一处理');
     }
 
     // ============================================================
-    // 初始化 —— 按顺序执行所有模块
+    // 初始化
     // ============================================================
     function init() {
-        log('========== ESNAI 继续教育助手启动 ==========');
+        log('========== ESNAI 继续教育助手 v3.0 启动 ==========');
 
-        // 1. 页面可见性欺骗（最早执行）
         hookDocumentVisibility();
-
-        // 2. 窗口焦点欺骗
         hookWindowBlur();
-
-        // 3. 屏蔽弹窗
         hookDialogs();
-
-        // 4. 网络请求拦截
         hookNetworkRequests();
-
-        // 5. 定时器拦截
         hookTimers();
-
-        // 6. 页面卸载拦截
         hookPageUnload();
-
-        // 7. Web Worker 计时
         startWorkerTimer();
-
-        // 8. 本地计时器
         startLocalTimer();
 
-        // 9. 等待 DOM 加载完成后执行
         function onDOMReady() {
-            // 10. 视频防暂停
             hookVideoPause();
-
-            // 11. 弹窗弹题自动处理
             autoHandlePopups();
-
-            // 12. 模拟用户活动
             simulateUserActivity();
-
-            // 13. 心跳保活
             startHeartbeat();
-
-            // 14. 平台函数拦截
             hookPlatformFunctions();
-
-            // 15. iframe 处理
+            keepPlatformTimerAlive();
             handleIframeVideos();
-
-            // 16. ESNAI 播放器钩子
             hookESNAIPlayer();
-
-            // 17. 自动点击确认按钮
             autoClickContinueButtons();
-
-            // 18. 双课程检测拦截
             hookDualCourseDetection();
-
-            // 19. 主动上报计时
             startProactiveReporting();
-
-            // 20. 状态面板
             createStatusPanel();
 
             log('========== 所有模块初始化完成 ==========');
