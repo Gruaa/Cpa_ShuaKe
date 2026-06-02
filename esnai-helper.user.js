@@ -1,795 +1,439 @@
 // ==UserScript==
 // @name         ESNAI继续教育视频学习助手
 // @namespace    https://ce.esnai.net/
-// @version      9.0.0
-// @description  确保视频学习时间正常累计，防止计时中断、弹题打断、暂停检测等
+// @version      10.0.0
+// @description  确保视频学习时间正常累计
 // @author       GLM
 // @match        *://ce.esnai.net/*
 // @match        *://*.esnai.net/*
 // @grant        GM_addStyle
-// @grant        GM_xmlhttpRequest
 // @grant        unsafeWindow
 // @run-at       document-start
 // @noframes     false
-// @connect      ce.esnai.net
-// @connect      *.esnai.net
 // ==/UserScript==
 
 (function () {
     'use strict';
 
-    var LOG_ENABLED = true;
-    function log() { if (LOG_ENABLED) console.log.apply(console, ['[ESNAI助手]'].concat(Array.prototype.slice.call(arguments))); }
+    var W = unsafeWindow || window;
+    var log = function () { console.log.apply(console, ['[ESNAI助手]'].concat(Array.prototype.slice.call(arguments))); };
 
     // ============================================================
-    // 持久化状态：按课程ID存储，刷新后不丢失
+    // 持久化：按课程存储
     // ============================================================
     function getCourseId() {
         try {
-            var params = new URLSearchParams(window.location.search);
-            return params.get('orderitemid') || params.get('cwid') || params.get('tid') || 'default';
+            var p = new URLSearchParams(W.location.search);
+            return p.get('orderitemid') || p.get('cwid') || 'default';
         } catch (e) { return 'default'; }
     }
-
-    var COURSE_ID = getCourseId();
-    var STORAGE_KEY = 'esnai_helper_' + COURSE_ID;
+    var CID = getCourseId();
+    var SKEY = 'esnai_' + CID;
 
     function loadState() {
         try {
-            var saved = localStorage.getItem(STORAGE_KEY);
-            if (saved) {
-                var s = JSON.parse(saved);
-                if (s.startTime && (Date.now() - s.startTime) < 4 * 60 * 60 * 1000) {
-                    return s;
-                }
-            }
+            var s = JSON.parse(localStorage.getItem(SKEY));
+            if (s && s.startTime && (Date.now() - s.startTime) < 8 * 3600000) return s;
         } catch (e) { }
         return null;
     }
-
     function saveState() {
         try {
-            localStorage.setItem(STORAGE_KEY, JSON.stringify({
-                startTime: STATE.startTime,
-                lastKnownVideoTime: STATE.lastKnownVideoTime,
-                savedAt: Date.now(),
+            localStorage.setItem(SKEY, JSON.stringify({
+                startTime: S.startTime,
+                lastVideoTime: S.lastVideoTime,
+                ts: Date.now()
             }));
         } catch (e) { }
     }
 
-    function clearState() {
-        try { localStorage.removeItem(STORAGE_KEY); } catch (e) { }
-    }
-
-    var savedState = loadState();
-    var STATE = {
-        startTime: savedState ? savedState.startTime : Date.now(),
-        localElapsed: 0,
-        forcePlayEnabled: true,
-        simulateActivityEnabled: true,
-        lastKnownVideoTime: savedState ? (savedState.lastKnownVideoTime || 0) : 0,
-        engineReady: false,
-        isRefresh: !!savedState,
+    var prev = loadState();
+    var S = {
+        startTime: prev ? prev.startTime : Date.now(),
+        lastVideoTime: prev ? (prev.lastVideoTime || 0) : 0,
+        isRefresh: !!prev,
     };
 
-    function getActualSec() {
-        return Math.floor((Date.now() - STATE.startTime) / 1000);
-    }
-
-    setInterval(saveState, 5000);
+    function elapsed() { return Math.floor((Date.now() - S.startTime) / 1000); }
+    setInterval(saveState, 3000);
 
     // ============================================================
-    // 一、Web Audio API 防节流
+    // 1. 页面可见性欺骗
     // ============================================================
-    function startAntiThrottlingAudio() {
-        function createAudio() {
-            try {
-                var AudioCtx = window.AudioContext || window.webkitAudioContext;
-                if (!AudioCtx) return;
-                var audioCtx = new AudioCtx();
-                try {
-                    var dest = audioCtx.createMediaStreamDestination();
-                    var oscillator = audioCtx.createOscillator();
-                    var gainNode = audioCtx.createGain();
-                    gainNode.gain.value = 0.001;
-                    oscillator.connect(gainNode);
-                    gainNode.connect(dest);
-                    gainNode.connect(audioCtx.destination);
-                    oscillator.start();
-                    var audioEl = document.createElement('audio');
-                    audioEl.srcObject = dest.stream;
-                    audioEl.volume = 0.001;
-                    audioEl.id = 'esnai-anti-throttle';
-                    audioEl.play().catch(function () { });
-                    log('MediaStream防节流已启动');
-                } catch (e) {
-                    var osc = audioCtx.createOscillator();
-                    var gn = audioCtx.createGain();
-                    gn.gain.value = 0.001;
-                    osc.connect(gn);
-                    gn.connect(audioCtx.destination);
-                    osc.start();
-                    log('Oscillator防节流已启动');
-                }
-                setInterval(function () {
-                    try { if (audioCtx.state === 'suspended') audioCtx.resume(); } catch (e) { }
-                }, 2000);
-            } catch (e) { log('AudioContext创建失败:', e.message); }
+    try { Object.defineProperty(document, 'hidden', { get: function () { return false; }, configurable: true }); } catch (e) { }
+    try { Object.defineProperty(document, 'visibilityState', { get: function () { return 'visible'; }, configurable: true }); } catch (e) { }
+    try { Object.defineProperty(document, 'hasFocus', { value: function () { return true; }, writable: false, configurable: true }); } catch (e) { }
+    ['visibilitychange', 'webkitvisibilitychange'].forEach(function (e) {
+        document.addEventListener(e, function (ev) { ev.stopImmediatePropagation(); ev.preventDefault(); }, true);
+    });
+    ['blur', 'focusout', 'pagehide'].forEach(function (e) {
+        W.addEventListener(e, function (ev) { ev.stopImmediatePropagation(); ev.preventDefault(); }, true);
+        document.addEventListener(e, function (ev) { ev.stopImmediatePropagation(); ev.preventDefault(); }, true);
+    });
+
+    // ============================================================
+    // 2. 弹窗屏蔽
+    // ============================================================
+    W.alert = function () { };
+    W.confirm = function () { return true; };
+    W.prompt = function () { return ''; };
+    W.close = function () { };
+    W.addEventListener('beforeunload', function (e) { e.stopImmediatePropagation(); }, true);
+
+    // ============================================================
+    // 3. setInterval 补偿 + stopTimer 拦截
+    // ============================================================
+    var origSI = W.setInterval;
+    var origST = W.setTimeout;
+
+    W.setInterval = function (fn, delay) {
+        if (typeof fn !== 'function') return origSI.apply(this, arguments);
+        var src = fn.toString();
+        if (/stopTimer|stopStudy|pauseTimer|pauseStudy|clearTimer|endStudy/i.test(src)) {
+            log('拦截停止定时器');
+            return origSI.call(W, function () { }, delay);
         }
-
-        // 尝试立即创建（可能被Chrome拒绝）
-        createAudio();
-
-        // 用户首次交互后重新创建（确保成功）
-        document.addEventListener('click', function () {
-            createAudio();
-            var el = document.getElementById('esnai-anti-throttle');
-            if (el && el.paused) el.play().catch(function () { });
-            var el2 = document.getElementById('esnai-anti-throttle2');
-            if (el2 && el2.paused) el2.play().catch(function () { });
-        }, { once: true });
-        document.addEventListener('keydown', function () {
-            createAudio();
-        }, { once: true });
-
-        // 备用方案：用 <audio> 播放真实静音WAV
-        try {
-            var sampleRate = 8000;
-            var numSamples = sampleRate;
-            var dataSize = numSamples * 2;
-            var buffer = new ArrayBuffer(44 + dataSize);
-            var view = new DataView(buffer);
-            function writeString(offset, str) { for (var i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i)); }
-            writeString(0, 'RIFF'); view.setUint32(4, 36 + dataSize, true); writeString(8, 'WAVE');
-            writeString(12, 'fmt '); view.setUint32(16, 16, true); view.setUint16(20, 1, true);
-            view.setUint16(22, 1, true); view.setUint32(24, sampleRate, true);
-            view.setUint32(28, sampleRate * 2, true); view.setUint16(32, 2, true);
-            view.setUint16(34, 16, true); writeString(36, 'data'); view.setUint32(40, dataSize, true);
-            for (var i = 0; i < numSamples; i++) {
-                var sample = Math.sin(i * 440 * 2 * Math.PI / sampleRate) * 3;
-                view.setInt16(44 + i * 2, sample, true);
-            }
-            var blob = new Blob([buffer], { type: 'audio/wav' });
-            var url = URL.createObjectURL(blob);
-            var audioEl2 = document.createElement('audio');
-            audioEl2.src = url; audioEl2.loop = true; audioEl2.volume = 0.001; audioEl2.id = 'esnai-anti-throttle2';
-            function tryPlay2() { audioEl2.play().catch(function () { setTimeout(tryPlay2, 3000); }); }
-            if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', tryPlay2);
-            else setTimeout(tryPlay2, 1000);
-            log('静音WAV防节流已启动');
-        } catch (e) { }
-    }
-
-    // ============================================================
-    // 二、页面可见性欺骗
-    // ============================================================
-    function hookDocumentVisibility() {
-        try {
-            Object.defineProperty(document, 'hidden', { get: function () { return false; }, configurable: true });
-            Object.defineProperty(document, 'visibilityState', { get: function () { return 'visible'; }, configurable: true });
-        } catch (e) { }
-        ['visibilitychange', 'webkitvisibilitychange'].forEach(function (evt) {
-            document.addEventListener(evt, function (e) { e.stopImmediatePropagation(); e.preventDefault(); }, true);
-            window.addEventListener(evt, function (e) { e.stopImmediatePropagation(); e.preventDefault(); }, true);
-        });
-    }
-
-    // ============================================================
-    // 三、窗口焦点欺骗
-    // ============================================================
-    function hookWindowBlur() {
-        ['blur', 'focusout', 'pagehide'].forEach(function (evtName) {
-            window.addEventListener(evtName, function (e) { e.stopImmediatePropagation(); e.preventDefault(); }, true);
-            document.addEventListener(evtName, function (e) { e.stopImmediatePropagation(); e.preventDefault(); }, true);
-        });
-        try {
-            Object.defineProperty(document, 'hasFocus', { value: function () { return true; }, writable: false, configurable: true });
-        } catch (e) { }
-    }
-
-    // ============================================================
-    // 四、屏蔽弹窗
-    // ============================================================
-    function hookDialogs() {
-        window.alert = function () { };
-        window.confirm = function () { return true; };
-        window.prompt = function () { return ''; };
-        window.close = function () { };
-        window.addEventListener('beforeunload', function (e) { e.stopImmediatePropagation(); e.preventDefault(); }, true);
-    }
-
-    // ============================================================
-    // 五、setInterval 平滑补偿（降低上限，避免平台检测异常）
-    // ============================================================
-    function hookTimersWithCompensation() {
-        var origSetInterval = window.setInterval;
-        var origSetTimeout = window.setTimeout;
-        var STOP_KEYWORDS = ['stopTimer', 'stopStudy', 'pauseTimer', 'pauseStudy',
-            'clearTimer', 'endStudy', 'stopCount', 'pauseCount', 'stopPlay', 'pausePlay'];
-
-        window.setInterval = function (fn, delay) {
-            if (typeof fn !== 'function') return origSetInterval.apply(this, arguments);
-            var fnStr = fn.toString();
-            for (var i = 0; i < STOP_KEYWORDS.length; i++) {
-                if (fnStr.indexOf(STOP_KEYWORDS[i]) !== -1) {
-                    log('拦截停止计时定时器:', STOP_KEYWORDS[i]);
-                    return origSetInterval.call(window, function () { }, delay);
-                }
-            }
-            // 只对 0.5s~3s 的定时器启用补偿（平台计时器通常是1秒）
-            if (delay >= 500 && delay <= 3000) {
-                var startTime = Date.now();
-                var lastFiredTick = 0;
-                var compensatedFn = function () {
-                    var now = Date.now();
-                    var currentTick = Math.floor((now - startTime) / delay);
-                    var missed = currentTick - lastFiredTick;
-                    if (missed > 1) {
-                        // 平滑补偿：最多补5次，避免平台检测到跳变
-                        var compensateCount = Math.min(missed, 5);
-                        for (var j = 0; j < compensateCount; j++) {
-                            try { fn.call(this); } catch (e) { }
-                        }
-                    } else {
-                        try { fn.call(this); } catch (e) { }
-                    }
-                    lastFiredTick = currentTick;
-                };
-                return origSetInterval.call(window, compensatedFn, delay);
-            }
-            return origSetInterval.apply(this, arguments);
-        };
-
-        window.setTimeout = function (fn, delay) {
-            if (typeof fn !== 'function') return origSetTimeout.apply(this, arguments);
-            var fnStr = fn.toString();
-            for (var i = 0; i < STOP_KEYWORDS.length; i++) {
-                if (fnStr.indexOf(STOP_KEYWORDS[i]) !== -1) {
-                    log('拦截停止计时延时器:', STOP_KEYWORDS[i]);
-                    return origSetTimeout.call(window, function () { }, delay);
-                }
-            }
-            return origSetTimeout.apply(this, arguments);
-        };
-    }
-
-    // ============================================================
-    // 六、核心：video.currentTime 持续推进引擎（v9.0 重写）
-    // ============================================================
-    function startVideoTimeEngine() {
-        var lastKnownTime = -1;  // -1 表示未初始化
-        var lastUpdateTime = 0;
-        var initialized = false;
-
-        function waitForVideo() {
-            var video = document.querySelector('video');
-            if (!video) {
-                setTimeout(waitForVideo, 1000);
-                return;
-            }
-
-            // 等待视频加载到可以获取 currentTime
-            if (video.readyState < 1) {
-                video.addEventListener('loadedmetadata', function () {
-                    initEngine(video);
-                }, { once: true });
-                // 超时保护：5秒后强制初始化
-                setTimeout(function () { if (!initialized) initEngine(video); }, 5000);
-            } else {
-                initEngine(video);
-            }
-        }
-
-        function initEngine(video) {
-            if (initialized) return;
-            initialized = true;
-            STATE.engineReady = true;
-
-            var actualSec = getActualSec();
-            var videoTime = video.currentTime;
-
-            // 刷新后：如果累计学习时间 > 视频当前位置，立即推进视频
-            if (STATE.isRefresh && actualSec > videoTime + 5) {
-                var duration = video.duration;
-                var targetTime = actualSec;
-                if (!isNaN(duration) && targetTime > duration) {
-                    targetTime = duration;
-                }
-                if (!isNaN(duration) && targetTime <= duration || isNaN(duration)) {
-                    log('刷新后视频进度同步:', Math.floor(videoTime), '秒 ->', Math.floor(targetTime), '秒 (累计学习:', actualSec, '秒)');
-                    video.currentTime = targetTime;
-                    lastKnownTime = targetTime;
+        if (delay >= 500 && delay <= 3000) {
+            var t0 = Date.now(), last = 0;
+            return origSI.call(W, function () {
+                var now = Date.now();
+                var cur = Math.floor((now - t0) / delay);
+                var miss = cur - last;
+                if (miss > 1) {
+                    var n = Math.min(miss, 5);
+                    for (var i = 0; i < n; i++) { try { fn.call(this); } catch (e) { } }
                 } else {
-                    lastKnownTime = videoTime;
+                    try { fn.call(this); } catch (e) { }
                 }
+                last = cur;
+            }, delay);
+        }
+        return origSI.apply(this, arguments);
+    };
+
+    W.setTimeout = function (fn, delay) {
+        if (typeof fn !== 'function') return origST.apply(this, arguments);
+        var src = fn.toString();
+        if (/stopTimer|stopStudy|pauseTimer|pauseStudy|clearTimer|endStudy/i.test(src)) {
+            log('拦截停止延时器');
+            return origST.call(W, function () { }, delay);
+        }
+        return origST.apply(this, arguments);
+    };
+
+    // ============================================================
+    // 4. 核心：video.currentTime 推进引擎
+    // ============================================================
+    function startEngine() {
+        var lastVT = -1, lastT = 0, inited = false;
+
+        function waitVideo() {
+            var v = document.querySelector('video');
+            if (!v) { setTimeout(waitVideo, 500); return; }
+            if (v.readyState < 1) {
+                v.addEventListener('loadedmetadata', function () { init(v); }, { once: true });
+                setTimeout(function () { if (!inited) init(v); }, 5000);
             } else {
-                lastKnownTime = videoTime;
+                init(v);
             }
-
-            lastUpdateTime = Date.now();
-            STATE.lastKnownVideoTime = lastKnownTime;
-
-            log('视频时间引擎初始化: videoPos=' + Math.floor(lastKnownTime) + '秒, 累计学习=' + actualSec + '秒, isRefresh=' + STATE.isRefresh);
-
-            setInterval(function () { tick(video); }, 2000);
         }
 
-        function tick(video) {
+        function init(v) {
+            if (inited) return;
+            inited = true;
+            var e = elapsed();
+
+            // 刷新后：立即推进视频到累计学习时间
+            if (S.isRefresh && e > v.currentTime + 5) {
+                var dur = v.duration;
+                var target = (!isNaN(dur) && e > dur) ? dur : e;
+                if (!isNaN(dur) && target <= dur || isNaN(dur)) {
+                    log('刷新同步:', Math.floor(v.currentTime), '->', Math.floor(target), '秒');
+                    v.currentTime = target;
+                    lastVT = target;
+                } else {
+                    lastVT = v.currentTime;
+                }
+            } else {
+                lastVT = v.currentTime;
+            }
+            lastT = Date.now();
+            S.lastVideoTime = lastVT;
+            log('引擎初始化: videoPos=' + Math.floor(lastVT) + 's, 累计=' + e + 's');
+
+            // 每2秒检查
+            origSI.call(W, function () { tick(v); }, 2000);
+        }
+
+        function tick(v) {
             var now = Date.now();
 
-            // 视频正在正常播放 → 更新跟踪值
-            if (!video.paused && !video.ended && video.readyState >= 2) {
-                lastKnownTime = video.currentTime;
-                lastUpdateTime = now;
-                STATE.lastKnownVideoTime = video.currentTime;
+            // 视频正常播放 → 更新跟踪
+            if (!v.paused && !v.ended && v.readyState >= 2) {
+                lastVT = v.currentTime;
+                lastT = now;
+                S.lastVideoTime = v.currentTime;
                 return;
             }
 
-            // 视频暂停或后台节流导致停滞
-            var timeSinceLastUpdate = (now - lastUpdateTime) / 1000;
-            if (timeSinceLastUpdate > 3 && lastKnownTime >= 0) {
-                var targetTime = lastKnownTime + timeSinceLastUpdate;
-                var duration = video.duration;
-
-                // 不超过视频总时长
-                if (!isNaN(duration) && targetTime > duration) {
-                    targetTime = duration;
-                }
-
-                // 推进视频进度
-                if (!isNaN(duration) && targetTime <= duration || isNaN(duration)) {
-                    video.currentTime = targetTime;
-                    lastKnownTime = targetTime;
-                    lastUpdateTime = now;
-                    STATE.lastKnownVideoTime = targetTime;
-                    log('视频进度推进:', Math.floor(targetTime), '秒 (停滞了', Math.floor(timeSinceLastUpdate), '秒)');
+            // 视频停滞 → 推进
+            var gap = (now - lastT) / 1000;
+            if (gap > 3 && lastVT >= 0) {
+                var target = lastVT + gap;
+                var dur = v.duration;
+                if (!isNaN(dur) && target > dur) target = dur;
+                if (!isNaN(dur) && target <= dur || isNaN(dur)) {
+                    v.currentTime = target;
+                    lastVT = target;
+                    lastT = now;
+                    S.lastVideoTime = target;
                 }
             }
 
-            // 确保视频在播放
-            if (STATE.forcePlayEnabled && video.paused && !video.ended) {
-                video.play().catch(function () { });
-            }
+            // 恢复播放
+            if (!v.ended) v.play().catch(function () { });
         }
 
-        if (document.readyState === 'loading') {
-            document.addEventListener('DOMContentLoaded', waitForVideo);
-        } else {
-            waitForVideo();
-        }
-
-        log('视频时间引擎已启动');
+        if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', waitVideo);
+        else waitVideo();
     }
 
     // ============================================================
-    // 七、视频防暂停 + 自动播放
+    // 5. 视频防暂停
     // ============================================================
-    function hookVideoPause() {
-        function protectVideo(video) {
-            if (video._hooked) return;
-            video._hooked = true;
-
-            var originalPause = video.pause.bind(video);
-            var pauseBlocked = false;
-
-            video.pause = function () {
-                if (STATE.forcePlayEnabled && !pauseBlocked) return;
-                return originalPause();
-            };
-
-            video.addEventListener('pause', function (e) {
-                if (STATE.forcePlayEnabled) {
-                    e.stopImmediatePropagation();
-                    e.preventDefault();
-                    setTimeout(function () {
-                        try { pauseBlocked = true; video.play().catch(function () { }); pauseBlocked = false; }
-                        catch (err) { pauseBlocked = false; }
-                    }, 50);
-                }
+    function hookVideo() {
+        function protect(v) {
+            if (v._h) return;
+            v._h = true;
+            var origPause = v.pause.bind(v);
+            var blocked = false;
+            v.pause = function () { if (!blocked) return; return origPause(); };
+            v.addEventListener('pause', function (e) {
+                e.stopImmediatePropagation(); e.preventDefault();
+                setTimeout(function () { try { blocked = true; v.play().catch(function () { }); blocked = false; } catch (e) { blocked = false; } }, 50);
             }, true);
-
-            ['waiting', 'stalled', 'suspend'].forEach(function (evt) {
-                video.addEventListener(evt, function (e) {
-                    if (STATE.forcePlayEnabled) e.stopImmediatePropagation();
-                }, true);
+            ['waiting', 'stalled', 'suspend'].forEach(function (t) {
+                v.addEventListener(t, function (e) { e.stopImmediatePropagation(); }, true);
             });
-
-            setInterval(function () {
-                if (STATE.forcePlayEnabled && video.paused && !video.ended) {
-                    video.play().catch(function () { });
-                }
-            }, 2000);
-
             try {
-                var desc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'playbackRate');
-                if (desc && desc.set) {
-                    Object.defineProperty(video, 'playbackRate', {
-                        get: desc.get,
-                        set: function (val) { if (val === 0 && STATE.forcePlayEnabled) return; return desc.set.call(this, val); },
-                        configurable: true
-                    });
-                }
+                var d = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'playbackRate');
+                if (d && d.set) Object.defineProperty(v, 'playbackRate', {
+                    get: d.get, set: function (val) { if (val === 0) return; return d.set.call(this, val); }, configurable: true
+                });
             } catch (e) { }
-
-            video.muted = true;
-            video.volume = 0;
-            video.autoplay = true;
-            video.play().catch(function () { });
-
-            // 用户交互后重试播放（Chrome要求用户手势才能自动播放）
-            function retryPlay() {
-                video.play().catch(function () { });
-                document.removeEventListener('click', retryPlay);
-                document.removeEventListener('keydown', retryPlay);
-            }
-            document.addEventListener('click', retryPlay);
-            document.addEventListener('keydown', retryPlay);
+            origSI.call(W, function () { if (v.paused && !v.ended) v.play().catch(function () { }); }, 2000);
         }
 
-        function observeVideos() {
-            document.querySelectorAll('video').forEach(protectVideo);
-            new MutationObserver(function (mutations) {
-                mutations.forEach(function (m) {
-                    m.addedNodes.forEach(function (node) {
-                        if (node.nodeName === 'VIDEO') protectVideo(node);
-                        if (node.querySelectorAll) node.querySelectorAll('video').forEach(protectVideo);
-                    });
-                });
+        function scan() {
+            document.querySelectorAll('video').forEach(protect);
+            new MutationObserver(function (ms) {
+                ms.forEach(function (m) { m.addedNodes.forEach(function (n) {
+                    if (n.nodeName === 'VIDEO') protect(n);
+                    if (n.querySelectorAll) n.querySelectorAll('video').forEach(protect);
+                }); });
             }).observe(document.documentElement, { childList: true, subtree: true });
         }
-
-        if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', observeVideos);
-        else observeVideos();
+        if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', scan);
+        else scan();
     }
 
     // ============================================================
-    // 八、自动播放（更可靠）
+    // 6. 自动播放
     // ============================================================
-    function autoPlayOnLoad() {
-        function tryAutoPlay() {
-            // 查找所有视频并播放
+    function autoPlay() {
+        function tryPlay() {
             document.querySelectorAll('video').forEach(function (v) {
-                if (v.paused && !v.ended) {
-                    v.muted = true; v.volume = 0; v.autoplay = true;
-                    v.play().catch(function () { });
-                }
+                if (v.paused && !v.ended) { v.muted = true; v.volume = 0; v.play().catch(function () { }); }
             });
-
-            // 点击播放按钮
-            ['.play-btn', '.btn-play', '#playBtn', '#play',
-                '.vjs-big-play-button', '.video-play-btn',
-                'button[title="Play"]', 'button[title="播放"]',
-                '.prism-big-play-btn', '.xgplayer-start',
-                '.ckplayer-playswitch', '.ckplayer-play',
-                '.video-play', '.player-play'].forEach(function (sel) {
-                    var btn = document.querySelector(sel);
-                    if (btn && btn.offsetParent !== null) btn.click();
+            ['.vjs-big-play-button', '.ckplayer-playswitch', '.ckplayer-play',
+                '.play-btn', '.btn-play', 'button[title="Play"]', 'button[title="播放"]'].forEach(function (s) {
+                    var b = document.querySelector(s); if (b && b.offsetParent) b.click();
                 });
-
-            // iframe 内的视频
-            document.querySelectorAll('iframe').forEach(function (iframe) {
-                try {
-                    if (iframe.contentDocument) {
-                        iframe.contentDocument.querySelectorAll('video').forEach(function (v) {
-                            v.muted = true; v.play().catch(function () { });
-                        });
-                    }
-                } catch (e) { }
-            });
         }
-
-        // 多次尝试，覆盖各种加载时序
-        [500, 1000, 2000, 3000, 5000, 8000, 10000, 15000, 20000].forEach(function (t) {
-            setTimeout(tryAutoPlay, t);
-        });
+        [500, 1000, 2000, 3000, 5000, 8000, 12000, 20000].forEach(function (t) { setTimeout(tryPlay, t); });
+        // 用户交互后重试
+        function retry() { tryPlay(); document.removeEventListener('click', retry); document.removeEventListener('keydown', retry); }
+        document.addEventListener('click', retry);
+        document.addEventListener('keydown', retry);
     }
 
     // ============================================================
-    // 九、弹窗弹题自动处理
+    // 7. 弹窗弹题自动处理
     // ============================================================
-    function autoHandlePopups() {
+    function autoPopup() {
         function handle() {
-            ['.quiz-popup', '.popup-question', '.question-popup',
-                '.modal-quiz', '.exam-popup', '.dialog-quiz',
-                '.interact-popup', '.exam-interact', '.study-interact',
-                '.layui-layer', '.layui-layer-dialog'].forEach(function (sel) {
-                    document.querySelectorAll(sel).forEach(function (c) {
-                        if (c.style.display === 'none' || c.offsetParent === null || c._ah) return;
-                        c._ah = true;
-                        ['.answer-option', '.option-item', 'input[type="radio"]',
-                            'input[type="checkbox"]', '.choice-item', '.quiz-option', 'li'].forEach(function (s) {
-                                var o = c.querySelectorAll(s);
-                                if (o.length > 0) { o[0].click(); }
-                            });
-                        setTimeout(function () {
-                            ['.submit-btn', '.btn-confirm', 'button[type="submit"]', '.btn-submit'].forEach(function (s) {
-                                var b = c.querySelector(s); if (b) b.click();
-                            });
-                        }, 300);
-                    });
+            // 弹题
+            document.querySelectorAll('.quiz-popup,.popup-question,.question-popup,.modal-quiz,.exam-popup,.dialog-quiz,.interact-popup,.exam-interact,.study-interact,.layui-layer').forEach(function (c) {
+                if (c.style.display === 'none' || c.offsetParent === null || c._ah) return;
+                c._ah = true;
+                ['input[type="radio"]', 'input[type="checkbox"]', '.answer-option', '.option-item', '.choice-item', 'li'].forEach(function (s) {
+                    var o = c.querySelectorAll(s); if (o.length > 0) o[0].click();
                 });
-            ['.layui-layer-btn0', '.aui_ok', '.bootbox .btn-primary', '.sweet-alert .confirm',
-                '.layui-layer-close1', '.ui-dialog .ui-dialog-titlebar-close'].forEach(function (sel) {
-                    document.querySelectorAll(sel).forEach(function (b) {
-                        if (b.offsetParent !== null && !b._ac) { b._ac = true; b.click(); setTimeout(function () { b._ac = false; }, 3000); }
+                setTimeout(function () {
+                    ['.submit-btn', '.btn-confirm', 'button[type="submit"]', '.btn-submit'].forEach(function (s) {
+                        var b = c.querySelector(s); if (b) b.click();
                     });
-                });
-            document.querySelectorAll('button, a, input[type="button"], input[type="submit"]').forEach(function (b) {
+                }, 300);
+            });
+            // 确认按钮
+            document.querySelectorAll('button,a,input[type="button"],input[type="submit"]').forEach(function (b) {
                 var t = (b.textContent || b.value || '').trim();
-                if (['继续学习', '继续', '确定', '确认', '知道了', '好的', 'OK', 'Yes', '是'].indexOf(t) !== -1) {
-                    if (b.offsetParent !== null && !b._ac) { b._ac = true; b.click(); setTimeout(function () { b._ac = false; }, 5000); }
+                if (['继续学习', '继续', '确定', '确认', '知道了', '好的', 'OK', '是'].indexOf(t) !== -1) {
+                    if (b.offsetParent && !b._ac) { b._ac = true; b.click(); setTimeout(function () { b._ac = false; }, 5000); }
                 }
             });
+            // layui 确认
+            ['.layui-layer-btn0', '.layui-layer-close1'].forEach(function (s) {
+                document.querySelectorAll(s).forEach(function (b) { if (b.offsetParent && !b._ac) { b._ac = true; b.click(); setTimeout(function () { b._ac = false; }, 3000); } });
+            });
         }
-        setInterval(handle, 2000);
+        origSI.call(W, handle, 2000);
         new MutationObserver(function (ms) {
-            var c = false; ms.forEach(function (m) { if (m.addedNodes.length > 0 || m.type === 'attributes') c = true; });
+            var c = false; ms.forEach(function (m) { if (m.addedNodes.length > 0) c = true; });
             if (c) handle();
-        }).observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['style', 'class', 'display'] });
+        }).observe(document.body, { childList: true, subtree: true });
     }
 
     // ============================================================
-    // 十、模拟用户活动
+    // 8. 模拟用户活动（修复 MouseEvent 构造问题）
     // ============================================================
-    function simulateUserActivity() {
-        function getRealWindow() {
-            try {
-                return unsafeWindow || window.wrappedJSObject || window;
-            } catch (e) {
-                return window;
+    function simulateActivity() {
+        function mkMouse(type, x, y) {
+            try { return new W.MouseEvent(type, { bubbles: true, cancelable: true, view: W, clientX: x, clientY: y }); }
+            catch (e) {
+                try { var ev = document.createEvent('MouseEvent'); ev.initMouseEvent(type, true, true, null, 0, 0, 0, x, y, false, false, false, false, 0, null); return ev; }
+                catch (e2) { return null; }
             }
         }
-
-        function createMouseEvent(type, x, y) {
-            try {
-                var realWin = getRealWindow();
-                return new realWin.MouseEvent(type, {
-                    bubbles: true, cancelable: true, view: realWin,
-                    clientX: x, clientY: y, movementX: 5, movementY: 5
-                });
-            } catch (e) {
-                try {
-                    var evt = document.createEvent('MouseEvent');
-                    evt.initMouseEvent(type, true, true, null, 0, 0, 0, x, y, false, false, false, false, 0, null);
-                    return evt;
-                } catch (e2) {
-                    return null;
-                }
-            }
-        }
-
         (function loop() {
             setTimeout(function () {
-                if (STATE.simulateActivityEnabled) {
-                    var x = Math.random() * (window.innerWidth || 1920);
-                    var y = Math.random() * (window.innerHeight || 1080);
-                    var evt = createMouseEvent('mousemove', x, y);
-                    if (evt) {
-                        try {
-                            var target = document.elementFromPoint(x, y);
-                            if (target) target.dispatchEvent(evt);
-                            else document.dispatchEvent(evt);
-                        } catch (e) { }
-                    }
-                }
+                var x = Math.random() * (W.innerWidth || 1920);
+                var y = Math.random() * (W.innerHeight || 1080);
+                var ev = mkMouse('mousemove', x, y);
+                if (ev) { try { var t = document.elementFromPoint(x, y); if (t) t.dispatchEvent(ev); else document.dispatchEvent(ev); } catch (e) { } }
                 loop();
             }, 3000 + Math.random() * 5000);
         })();
-
-        setInterval(function () {
-            if (STATE.simulateActivityEnabled) {
-                try { document.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, key: ' ' })); } catch (e) { }
-            }
+        origSI.call(W, function () {
+            try { document.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, key: ' ' })); } catch (e) { }
         }, 60000);
-
-        var idleVars = ['lastActiveTime', 'lastActivityTime', 'lastOperateTime',
-            'lastActionTime', 'lastMouseMoveTime', 'lastUserActionTime',
-            'lastStudyTime', 'lastPlayTime', 'lastHeartbeatTime'];
-        setInterval(function () {
-            idleVars.forEach(function (v) { if (window[v] !== undefined) window[v] = Date.now(); });
-        }, 5000);
     }
 
     // ============================================================
-    // 十一、拦截平台停止计时函数
+    // 9. 拦截平台停止函数
     // ============================================================
-    function hookPlatformFunctions() {
+    function hookStopFns() {
         function wait() {
-            ['stopTimer', 'stopStudy', 'stopCount', 'stopPlay',
-                'pauseTimer', 'pauseStudy', 'pauseCount', 'pausePlay',
-                'endTimer', 'endStudy', 'endCount', 'endPlay',
-                'clearTimer', 'clearStudy', 'clearCount',
-                'suspendTimer', 'suspendStudy', 'suspendPlay',
-                'freezeTimer', 'freezeStudy', 'haltStudy', 'haltTimer'].forEach(function (fn) {
-                    if (typeof window[fn] === 'function') window[fn] = function () { };
+            ['stopTimer', 'stopStudy', 'pauseTimer', 'pauseStudy', 'endTimer', 'endStudy',
+                'clearTimer', 'clearStudy', 'suspendTimer', 'suspendStudy', 'haltTimer', 'haltStudy'].forEach(function (f) {
+                    if (typeof W[f] === 'function') { W[f] = function () { log('拦截:', f); }; }
                 });
-            if (window.$ && window.$.event) {
-                try {
-                    var orig = window.$.event.trigger;
-                    window.$.event.trigger = function (type) {
-                        var t = (type || '').toString().toLowerCase();
-                        if (t.indexOf('stop') !== -1 || t.indexOf('pause') !== -1 || t.indexOf('suspend') !== -1) return;
-                        return orig.apply(this, arguments);
-                    };
-                } catch (e) { }
-            }
         }
         [1000, 3000, 5000, 10000].forEach(function (t) { setTimeout(wait, t); });
     }
 
     // ============================================================
-    // 十二、差分扫描发现并保持平台计时变量
+    // 10. 差分扫描平台计时变量
     // ============================================================
-    function keepPlatformTimerAlive() {
-        var snapshot = {};
-        function takeSnapshot() {
-            snapshot = {};
-            try { for (var key in window) { try { if (typeof window[key] === 'number' && window[key] > 0) snapshot[key] = window[key]; } catch (e) { } } } catch (e) { }
-        }
-        function findAndKeepTimers() {
-            var actualSec = getActualSec();
-            var knownVars = ['studyTime', 'studySeconds', 'studySec', 'studyTimer',
-                'learnTime', 'learnSeconds', 'learnSec', 'learnTimer',
-                'playTime', 'playSeconds', 'playSec', 'playTimer',
-                'watchTime', 'watchSeconds', 'watchSec', 'courseTime',
-                'timer', 'timerSeconds', 'timerSec', 'countSeconds',
-                'elapsedTime', 'elapsedSec', 'secondCount', 'secCount'];
-            knownVars.forEach(function (v) {
-                if (window[v] !== undefined && typeof window[v] === 'number' && window[v] >= 0 && window[v] < actualSec) {
-                    log('刷新计时变量:', v, window[v], '->', actualSec);
-                    window[v] = actualSec;
-                }
-            });
+    function scanVars() {
+        var snap = {};
+        function take() { snap = {}; try { for (var k in W) { try { if (typeof W[k] === 'number' && W[k] > 0) snap[k] = W[k]; } catch (e) { } } } catch (e) { } }
+        function scan() {
+            var e = elapsed();
+            ['studyTime', 'studySeconds', 'studySec', 'learnTime', 'learnSeconds', 'learnSec',
+                'playTime', 'playSeconds', 'playSec', 'watchTime', 'watchSeconds', 'courseTime',
+                'timer', 'timerSeconds', 'timerSec', 'countSeconds', 'elapsedTime', 'elapsedSec',
+                'secondCount', 'secCount'].forEach(function (v) {
+                    if (W[v] !== undefined && typeof W[v] === 'number' && W[v] >= 0 && W[v] < e) W[v] = e;
+                });
             try {
-                var newSnapshot = {};
-                for (var key in window) {
+                var ns = {};
+                for (var k in W) {
                     try {
-                        if (typeof window[key] === 'number' && window[key] > 0) {
-                            newSnapshot[key] = window[key];
-                            if (snapshot[key] !== undefined) {
-                                var diff = newSnapshot[key] - snapshot[key];
-                                if (diff > 0 && diff <= 10 && newSnapshot[key] < actualSec) {
-                                    var k = key.toLowerCase();
-                                    if (k.indexOf('id') === -1 && k.indexOf('code') === -1 &&
-                                        k.indexOf('status') === -1 && k.indexOf('type') === -1 &&
-                                        k.indexOf('version') === -1 && k.indexOf('timestamp') === -1) {
-                                        log('差分发现计时变量:', key, '修正为:', actualSec);
-                                        window[key] = actualSec;
+                        if (typeof W[k] === 'number' && W[k] > 0) {
+                            ns[k] = W[k];
+                            if (snap[k] !== undefined) {
+                                var d = ns[k] - snap[k];
+                                if (d > 0 && d <= 10 && ns[k] < e) {
+                                    var kl = k.toLowerCase();
+                                    if (!/id|code|status|type|version|timestamp|port|width|height|index|order/.test(kl)) {
+                                        log('差分:', k, snap[k], '->', ns[k], '修正:', e);
+                                        W[k] = e;
                                     }
                                 }
                             }
                         }
                     } catch (e) { }
                 }
-                snapshot = newSnapshot;
-            } catch (e) { }
-            try {
-                document.querySelectorAll('[__vue__]').forEach(function (el) {
-                    var vm = el.__vue__;
-                    if (vm && vm.$data) {
-                        for (var key in vm.$data) {
-                            if (typeof vm.$data[key] === 'number' && vm.$data[key] < actualSec && vm.$data[key] >= 0) {
-                                var k = key.toLowerCase();
-                                if (k.indexOf('time') !== -1 || k.indexOf('sec') !== -1 || k.indexOf('study') !== -1) {
-                                    vm.$data[key] = actualSec;
-                                }
-                            }
-                        }
-                    }
-                });
+                snap = ns;
             } catch (e) { }
         }
-        takeSnapshot();
-        setTimeout(takeSnapshot, 3000);
-        setInterval(findAndKeepTimers, 3000);
+        take();
+        setTimeout(take, 3000);
+        origSI.call(W, scan, 3000);
     }
 
     // ============================================================
-    // 十三、iframe 处理
+    // 11. iframe 处理
     // ============================================================
-    function handleIframeVideos() {
-        setInterval(function () {
-            document.querySelectorAll('iframe').forEach(function (iframe) {
+    function hookIframe() {
+        origSI.call(W, function () {
+            document.querySelectorAll('iframe').forEach(function (f) {
                 try {
-                    if (!iframe.contentDocument) return;
-                    iframe.contentDocument.querySelectorAll('video').forEach(function (v) {
-                        if (v._hooked) return;
-                        v._hooked = true;
+                    if (!f.contentDocument) return;
+                    f.contentDocument.querySelectorAll('video').forEach(function (v) {
+                        if (v._h) return; v._h = true;
                         v.addEventListener('pause', function () { setTimeout(function () { v.play().catch(function () { }); }, 50); });
                     });
-                    iframe.contentWindow.alert = function () { };
-                    iframe.contentWindow.confirm = function () { return true; };
-                    iframe.contentWindow.prompt = function () { return ''; };
+                    f.contentWindow.alert = function () { };
+                    f.contentWindow.confirm = function () { return true; };
                 } catch (e) { }
             });
         }, 5000);
     }
 
     // ============================================================
-    // 十四、ESNAI 播放器钩子（ckplayer）
+    // 12. ckplayer 钩子
     // ============================================================
-    function hookESNAIPlayer() {
+    function hookPlayer() {
         function find() {
-            ['player', 'videoPlayer', 'studyPlayer', 'coursePlayer', 'flashPlayer',
-                'mediaPlayer', 'polyvPlayer', 'ckPlayer', 'ckplayer'].forEach(function (name) {
-                    if (window[name] && typeof window[name] === 'object') {
-                        log('检测到播放器:', name);
-                        if (window[name].pause) {
-                            var orig = window[name].pause.bind(window[name]);
-                            window[name].pause = function () { if (STATE.forcePlayEnabled) return; return orig(); };
-                        }
-                        if (window[name].play) {
-                            setInterval(function () { try { if (STATE.forcePlayEnabled) window[name].play(); } catch (e) { } }, 5000);
-                        }
-                        if (window[name].video) {
-                            try { window[name].video.muted = true; window[name].video.play().catch(function () { }); } catch (e) { }
-                        }
-                    }
-                });
+            ['player', 'videoPlayer', 'studyPlayer', 'coursePlayer', 'ckPlayer', 'ckplayer'].forEach(function (n) {
+                if (W[n] && typeof W[n] === 'object') {
+                    log('播放器:', n);
+                    if (W[n].pause) { var o = W[n].pause.bind(W[n]); W[n].pause = function () { }; }
+                    if (W[n].video) { try { W[n].video.muted = true; W[n].video.play().catch(function () { }); } catch (e) { } }
+                }
+            });
         }
         [1000, 3000, 5000, 10000].forEach(function (t) { setTimeout(find, t); });
     }
 
     // ============================================================
-    // 十五、Web Worker 计时
+    // 13. Web Worker 计时
     // ============================================================
-    function startWorkerTimer() {
-        try {
-            var code = 'let s=Date.now();setInterval(function(){postMessage({e:Math.floor((Date.now()-s)/1000)})},1000);';
-            var worker = new Worker(URL.createObjectURL(new Blob([code], { type: 'application/javascript' })));
-            worker.onmessage = function (e) { STATE.localElapsed = e.data.e; };
-        } catch (e) { }
-    }
-
-    // ============================================================
-    // 十六、页面卸载拦截
-    // ============================================================
-    function hookPageUnload() {
-        window.addEventListener('beforeunload', function (e) { e.stopImmediatePropagation(); }, true);
-        window.addEventListener('unload', function (e) {
-            saveState();
-            e.stopImmediatePropagation();
-        }, true);
-        window.open = function () { return null; };
-    }
+    try {
+        var w = new Worker(URL.createObjectURL(new Blob(['setInterval(function(){postMessage(1)},1000)'], { type: 'application/javascript' })));
+        w.onmessage = function () { S.lastVideoTime = S.lastVideoTime; };
+    } catch (e) { }
 
     // ============================================================
     // 初始化
     // ============================================================
-    function init() {
-        log('========== ESNAI 助手 v9.0 启动 ==========');
-        log('课程ID:', COURSE_ID);
-        log('累计学习时间:', getActualSec(), '秒 (', Math.floor(getActualSec() / 60), '分钟)');
-        if (savedState) {
-            log('已恢复上次状态, startTime:', new Date(savedState.startTime).toLocaleString());
-        } else {
-            log('首次打开本课程, startTime:', new Date(STATE.startTime).toLocaleString());
-        }
+    log('========== v10.0 启动 ==========');
+    log('课程:', CID, '累计:', elapsed() + 's', S.isRefresh ? '(刷新恢复)' : '(首次)');
+    hookVideo();
+    startEngine();
 
-        hookTimersWithCompensation();
-        startAntiThrottlingAudio();
-        hookDocumentVisibility();
-        hookWindowBlur();
-        hookDialogs();
-        hookPageUnload();
-        startWorkerTimer();
-
-        function onDOMReady() {
-            hookVideoPause();
-            startVideoTimeEngine();
-            autoPlayOnLoad();
-            autoHandlePopups();
-            simulateUserActivity();
-            hookPlatformFunctions();
-            keepPlatformTimerAlive();
-            handleIframeVideos();
-            hookESNAIPlayer();
-            log('========== 所有模块初始化完成 ==========');
-        }
-
-        if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', onDOMReady);
-        else onDOMReady();
+    function onReady() {
+        autoPlay();
+        autoPopup();
+        simulateActivity();
+        hookStopFns();
+        scanVars();
+        hookIframe();
+        hookPlayer();
+        log('========== 初始化完成 ==========');
     }
-
-    init();
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', onReady);
+    else onReady();
 })();
