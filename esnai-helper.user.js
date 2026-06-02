@@ -8,6 +8,7 @@
 // @match        *://*.esnai.net/*
 // @grant        GM_addStyle
 // @grant        GM_xmlhttpRequest
+// @grant        unsafeWindow
 // @run-at       document-start
 // @noframes     false
 // @connect      ce.esnai.net
@@ -81,44 +82,57 @@
     // 一、Web Audio API 防节流
     // ============================================================
     function startAntiThrottlingAudio() {
-        try {
-            var AudioCtx = window.AudioContext || window.webkitAudioContext;
-            if (!AudioCtx) return;
-            var audioCtx = new AudioCtx();
+        function createAudio() {
             try {
-                var dest = audioCtx.createMediaStreamDestination();
-                var oscillator = audioCtx.createOscillator();
-                var gainNode = audioCtx.createGain();
-                gainNode.gain.value = 0.001;
-                oscillator.connect(gainNode);
-                gainNode.connect(dest);
-                gainNode.connect(audioCtx.destination);
-                oscillator.start();
-                var audioEl = document.createElement('audio');
-                audioEl.srcObject = dest.stream;
-                audioEl.volume = 0.001;
-                audioEl.id = 'esnai-anti-throttle';
-                audioEl.play().catch(function () {
-                    document.addEventListener('click', function () { audioEl.play().catch(function () { }); }, { once: true });
-                });
-            } catch (e) {
-                var osc = audioCtx.createOscillator();
-                var gn = audioCtx.createGain();
-                gn.gain.value = 0.001;
-                osc.connect(gn);
-                gn.connect(audioCtx.destination);
-                osc.start();
-            }
-            setInterval(function () {
-                try { if (audioCtx.state === 'suspended') audioCtx.resume(); } catch (e) { }
-            }, 2000);
-            document.addEventListener('click', function () {
-                try { if (audioCtx.state === 'suspended') audioCtx.resume(); } catch (e) { }
-                var el = document.getElementById('esnai-anti-throttle');
-                if (el && el.paused) el.play().catch(function () { });
-            }, { once: true });
-        } catch (e) { }
+                var AudioCtx = window.AudioContext || window.webkitAudioContext;
+                if (!AudioCtx) return;
+                var audioCtx = new AudioCtx();
+                try {
+                    var dest = audioCtx.createMediaStreamDestination();
+                    var oscillator = audioCtx.createOscillator();
+                    var gainNode = audioCtx.createGain();
+                    gainNode.gain.value = 0.001;
+                    oscillator.connect(gainNode);
+                    gainNode.connect(dest);
+                    gainNode.connect(audioCtx.destination);
+                    oscillator.start();
+                    var audioEl = document.createElement('audio');
+                    audioEl.srcObject = dest.stream;
+                    audioEl.volume = 0.001;
+                    audioEl.id = 'esnai-anti-throttle';
+                    audioEl.play().catch(function () { });
+                    log('MediaStream防节流已启动');
+                } catch (e) {
+                    var osc = audioCtx.createOscillator();
+                    var gn = audioCtx.createGain();
+                    gn.gain.value = 0.001;
+                    osc.connect(gn);
+                    gn.connect(audioCtx.destination);
+                    osc.start();
+                    log('Oscillator防节流已启动');
+                }
+                setInterval(function () {
+                    try { if (audioCtx.state === 'suspended') audioCtx.resume(); } catch (e) { }
+                }, 2000);
+            } catch (e) { log('AudioContext创建失败:', e.message); }
+        }
 
+        // 尝试立即创建（可能被Chrome拒绝）
+        createAudio();
+
+        // 用户首次交互后重新创建（确保成功）
+        document.addEventListener('click', function () {
+            createAudio();
+            var el = document.getElementById('esnai-anti-throttle');
+            if (el && el.paused) el.play().catch(function () { });
+            var el2 = document.getElementById('esnai-anti-throttle2');
+            if (el2 && el2.paused) el2.play().catch(function () { });
+        }, { once: true });
+        document.addEventListener('keydown', function () {
+            createAudio();
+        }, { once: true });
+
+        // 备用方案：用 <audio> 播放真实静音WAV
         try {
             var sampleRate = 8000;
             var numSamples = sampleRate;
@@ -142,7 +156,7 @@
             function tryPlay2() { audioEl2.play().catch(function () { setTimeout(tryPlay2, 3000); }); }
             if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', tryPlay2);
             else setTimeout(tryPlay2, 1000);
-            document.addEventListener('click', function () { if (audioEl2.paused) audioEl2.play().catch(function () { }); }, { once: true });
+            log('静音WAV防节流已启动');
         } catch (e) { }
     }
 
@@ -400,9 +414,16 @@
             video.muted = true;
             video.volume = 0;
             video.autoplay = true;
-            video.play().catch(function () {
-                document.addEventListener('click', function () { video.play().catch(function () { }); }, { once: true });
-            });
+            video.play().catch(function () { });
+
+            // 用户交互后重试播放（Chrome要求用户手势才能自动播放）
+            function retryPlay() {
+                video.play().catch(function () { });
+                document.removeEventListener('click', retryPlay);
+                document.removeEventListener('keydown', retryPlay);
+            }
+            document.addEventListener('click', retryPlay);
+            document.addEventListener('keydown', retryPlay);
         }
 
         function observeVideos() {
@@ -511,22 +532,56 @@
     // 十、模拟用户活动
     // ============================================================
     function simulateUserActivity() {
+        function getRealWindow() {
+            try {
+                return unsafeWindow || window.wrappedJSObject || window;
+            } catch (e) {
+                return window;
+            }
+        }
+
+        function createMouseEvent(type, x, y) {
+            try {
+                var realWin = getRealWindow();
+                return new realWin.MouseEvent(type, {
+                    bubbles: true, cancelable: true, view: realWin,
+                    clientX: x, clientY: y, movementX: 5, movementY: 5
+                });
+            } catch (e) {
+                try {
+                    var evt = document.createEvent('MouseEvent');
+                    evt.initMouseEvent(type, true, true, null, 0, 0, 0, x, y, false, false, false, false, 0, null);
+                    return evt;
+                } catch (e2) {
+                    return null;
+                }
+            }
+        }
+
         (function loop() {
             setTimeout(function () {
                 if (STATE.simulateActivityEnabled) {
-                    var x = Math.random() * window.innerWidth;
-                    var y = Math.random() * window.innerHeight;
-                    document.elementFromPoint(x, y)?.dispatchEvent(new MouseEvent('mousemove', {
-                        bubbles: true, cancelable: true, view: window,
-                        clientX: x, clientY: y, movementX: 5, movementY: 5
-                    }));
+                    var x = Math.random() * (window.innerWidth || 1920);
+                    var y = Math.random() * (window.innerHeight || 1080);
+                    var evt = createMouseEvent('mousemove', x, y);
+                    if (evt) {
+                        try {
+                            var target = document.elementFromPoint(x, y);
+                            if (target) target.dispatchEvent(evt);
+                            else document.dispatchEvent(evt);
+                        } catch (e) { }
+                    }
                 }
                 loop();
             }, 3000 + Math.random() * 5000);
         })();
+
         setInterval(function () {
-            if (STATE.simulateActivityEnabled) document.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, key: ' ' }));
+            if (STATE.simulateActivityEnabled) {
+                try { document.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, key: ' ' })); } catch (e) { }
+            }
         }, 60000);
+
         var idleVars = ['lastActiveTime', 'lastActivityTime', 'lastOperateTime',
             'lastActionTime', 'lastMouseMoveTime', 'lastUserActionTime',
             'lastStudyTime', 'lastPlayTime', 'lastHeartbeatTime'];
