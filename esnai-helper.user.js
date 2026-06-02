@@ -21,17 +21,24 @@
     function log() { if (LOG_ENABLED) console.log.apply(console, ['[ESNAI助手]'].concat(Array.prototype.slice.call(arguments))); }
 
     // ============================================================
-    // 持久化状态：刷新后不丢失
+    // 持久化状态：按课程ID存储，刷新后不丢失
     // ============================================================
-    var STORAGE_KEY = 'esnai_helper_state';
+    function getCourseId() {
+        try {
+            var params = new URLSearchParams(window.location.search);
+            return params.get('orderitemid') || params.get('cwid') || params.get('tid') || 'default';
+        } catch (e) { return 'default'; }
+    }
+
+    var COURSE_ID = getCourseId();
+    var STORAGE_KEY = 'esnai_helper_' + COURSE_ID;
 
     function loadState() {
         try {
             var saved = localStorage.getItem(STORAGE_KEY);
             if (saved) {
                 var s = JSON.parse(saved);
-                // 如果上次保存时间在2小时内，恢复startTime
-                if (s.startTime && (Date.now() - s.startTime) < 2 * 60 * 60 * 1000) {
+                if (s.startTime && (Date.now() - s.startTime) < 4 * 60 * 60 * 1000) {
                     return s;
                 }
             }
@@ -49,6 +56,10 @@
         } catch (e) { }
     }
 
+    function clearState() {
+        try { localStorage.removeItem(STORAGE_KEY); } catch (e) { }
+    }
+
     var savedState = loadState();
     var STATE = {
         startTime: savedState ? savedState.startTime : Date.now(),
@@ -57,14 +68,14 @@
         simulateActivityEnabled: true,
         lastKnownVideoTime: savedState ? (savedState.lastKnownVideoTime || 0) : 0,
         engineReady: false,
+        isRefresh: !!savedState,
     };
 
     function getActualSec() {
         return Math.floor((Date.now() - STATE.startTime) / 1000);
     }
 
-    // 定期保存状态
-    setInterval(saveState, 10000);
+    setInterval(saveState, 5000);
 
     // ============================================================
     // 一、Web Audio API 防节流
@@ -260,13 +271,32 @@
             initialized = true;
             STATE.engineReady = true;
 
-            // 从视频当前位置初始化，不从0
-            lastKnownTime = video.currentTime;
+            var actualSec = getActualSec();
+            var videoTime = video.currentTime;
+
+            // 刷新后：如果累计学习时间 > 视频当前位置，立即推进视频
+            if (STATE.isRefresh && actualSec > videoTime + 5) {
+                var duration = video.duration;
+                var targetTime = actualSec;
+                if (!isNaN(duration) && targetTime > duration) {
+                    targetTime = duration;
+                }
+                if (!isNaN(duration) && targetTime <= duration || isNaN(duration)) {
+                    log('刷新后视频进度同步:', Math.floor(videoTime), '秒 ->', Math.floor(targetTime), '秒 (累计学习:', actualSec, '秒)');
+                    video.currentTime = targetTime;
+                    lastKnownTime = targetTime;
+                } else {
+                    lastKnownTime = videoTime;
+                }
+            } else {
+                lastKnownTime = videoTime;
+            }
+
             lastUpdateTime = Date.now();
+            STATE.lastKnownVideoTime = lastKnownTime;
 
-            log('视频时间引擎初始化: currentTime=' + Math.floor(lastKnownTime) + '秒, 累计学习=' + getActualSec() + '秒');
+            log('视频时间引擎初始化: videoPos=' + Math.floor(lastKnownTime) + '秒, 累计学习=' + actualSec + '秒, isRefresh=' + STATE.isRefresh);
 
-            // 每2秒检查一次
             setInterval(function () { tick(video); }, 2000);
         }
 
@@ -673,9 +703,12 @@
     // ============================================================
     function init() {
         log('========== ESNAI 助手 v9.0 启动 ==========');
+        log('课程ID:', COURSE_ID);
         log('累计学习时间:', getActualSec(), '秒 (', Math.floor(getActualSec() / 60), '分钟)');
         if (savedState) {
             log('已恢复上次状态, startTime:', new Date(savedState.startTime).toLocaleString());
+        } else {
+            log('首次打开本课程, startTime:', new Date(STATE.startTime).toLocaleString());
         }
 
         hookTimersWithCompensation();
