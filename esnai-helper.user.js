@@ -410,13 +410,17 @@
                 var modified = body;
                 var changed4 = false;
                 var patterns = [
-                    /([\"']?(?:second|sec|seconds|studytime|learntime|duration|elapsed|studysecond|watchtime|coursetime|totaltime|timersecond|countsecond|studysec|learnsec|playsec)[\"']?\s*[=:]\s*)\d+/gi,
-                    /([\"']?(?:study_time|learn_time|play_time|study_second|learn_second|play_second|watch_time|course_time|total_time|count_second|study_sec|learn_sec|play_sec)[\"']?\s*[=:]\s*)\d+/gi,
+                    /([\"']?(?:second|sec|seconds|studytime|learntime|duration|elapsed|studysecond|watchtime|coursetime|totaltime|timersecond|countsecond|studysec|learnsec|playsec)[\"']?\s*[=:]\s*)(\d+)/gi,
+                    /([\"']?(?:study_time|learn_time|play_time|study_second|learn_second|play_second|watch_time|course_time|total_time|count_second|study_sec|learn_sec|play_sec)[\"']?\s*[=:]\s*)(\d+)/gi,
                 ];
                 patterns.forEach(function (pat) {
-                    modified = modified.replace(pat, function (match, prefix) {
-                        changed4 = true;
-                        return prefix + actualSec;
+                    modified = modified.replace(pat, function (match, prefix, numStr) {
+                        var num = parseInt(numStr, 10);
+                        if (!isNaN(num) && num >= 0 && num < actualSec) {
+                            changed4 = true;
+                            return prefix + actualSec;
+                        }
+                        return match;
                     });
                 });
                 if (changed4) return { modified: modified, changed: true };
@@ -478,8 +482,6 @@
                 var urlResult = modifyUrl(url, actualSec);
                 if (urlResult.changed) {
                     this._hookUrl = urlResult.modified;
-                    arguments.callee.caller ? null : null;
-                    // 重新调用open更新URL
                     try { xhrOpen.call(this, this._hookMethod || 'GET', urlResult.modified, true); } catch (e) { }
                     log('URL参数已修正');
                 }
@@ -604,19 +606,43 @@
         };
 
         // ★ Hook 动态创建的 <img> 和 <script>（图片信标和JSONP）
-        var origCreateElement = document.createElement.bind(document);
-        document.createElement = function (tagName) {
-            var el = origCreateElement(tagName);
-            if (tagName.toLowerCase() === 'img' || tagName.toLowerCase() === 'script') {
-                var origSrcSetter = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'src') ||
-                    Object.getOwnPropertyDescriptor(el.__proto__, 'src');
-                if (origSrcSetter && origSrcSetter.set) {
-                    // We'll intercept src assignment via the property descriptor on this element
+        var origSetAttribute = Element.prototype.setAttribute;
+        Element.prototype.setAttribute = function (name, value) {
+            if ((name === 'src' || name === 'href') && typeof value === 'string') {
+                if (isStudyRelatedRequest(value)) {
+                    var actualSec = getActualSec();
+                    var urlResult = modifyUrl(value, actualSec);
+                    if (urlResult.changed) {
+                        log('setAttribute URL参数修正:', name, value.substring(0, 100), '->', urlResult.modified.substring(0, 100));
+                        value = urlResult.modified;
+                    }
                 }
-                // Use MutationObserver approach instead - monitor src attribute changes
             }
-            return el;
+            return origSetAttribute.call(this, name, value);
         };
+
+        // 同时 hook src 属性赋值
+        var srcDesc = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'src') ||
+            Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'src');
+        if (srcDesc && srcDesc.set) {
+            var origSrcSet = srcDesc.set;
+            var origSrcGet = srcDesc.get;
+            Object.defineProperty(HTMLImageElement.prototype, 'src', {
+                get: origSrcGet,
+                set: function (value) {
+                    if (typeof value === 'string' && isStudyRelatedRequest(value)) {
+                        var actualSec = getActualSec();
+                        var urlResult = modifyUrl(value, actualSec);
+                        if (urlResult.changed) {
+                            log('img.src URL参数修正:', value.substring(0, 100));
+                            value = urlResult.modified;
+                        }
+                    }
+                    return origSrcSet.call(this, value);
+                },
+                configurable: true
+            });
+        }
 
         log('网络请求拦截已激活（含URL参数/sendBeacon/WebSocket/图片信标）');
     }
