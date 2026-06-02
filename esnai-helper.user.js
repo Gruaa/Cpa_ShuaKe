@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ESNAI继续教育视频学习助手
 // @namespace    https://ce.esnai.net/
-// @version      8.0.0
+// @version      9.0.0
 // @description  确保视频学习时间正常累计，防止计时中断、弹题打断、暂停检测等
 // @author       GLM
 // @match        *://ce.esnai.net/*
@@ -20,19 +20,51 @@
     var LOG_ENABLED = true;
     function log() { if (LOG_ENABLED) console.log.apply(console, ['[ESNAI助手]'].concat(Array.prototype.slice.call(arguments))); }
 
+    // ============================================================
+    // 持久化状态：刷新后不丢失
+    // ============================================================
+    var STORAGE_KEY = 'esnai_helper_state';
+
+    function loadState() {
+        try {
+            var saved = localStorage.getItem(STORAGE_KEY);
+            if (saved) {
+                var s = JSON.parse(saved);
+                // 如果上次保存时间在2小时内，恢复startTime
+                if (s.startTime && (Date.now() - s.startTime) < 2 * 60 * 60 * 1000) {
+                    return s;
+                }
+            }
+        } catch (e) { }
+        return null;
+    }
+
+    function saveState() {
+        try {
+            localStorage.setItem(STORAGE_KEY, JSON.stringify({
+                startTime: STATE.startTime,
+                lastKnownVideoTime: STATE.lastKnownVideoTime,
+                savedAt: Date.now(),
+            }));
+        } catch (e) { }
+    }
+
+    var savedState = loadState();
     var STATE = {
-        startTime: Date.now(),
+        startTime: savedState ? savedState.startTime : Date.now(),
         localElapsed: 0,
-        lastReportedSec: 0,
         forcePlayEnabled: true,
         simulateActivityEnabled: true,
-        discoveredAPIs: [],
-        videoTimeOffset: 0,
+        lastKnownVideoTime: savedState ? (savedState.lastKnownVideoTime || 0) : 0,
+        engineReady: false,
     };
 
     function getActualSec() {
         return Math.floor((Date.now() - STATE.startTime) / 1000);
     }
+
+    // 定期保存状态
+    setInterval(saveState, 10000);
 
     // ============================================================
     // 一、Web Audio API 防节流
@@ -142,7 +174,7 @@
     }
 
     // ============================================================
-    // 五、setInterval 补偿机制
+    // 五、setInterval 平滑补偿（降低上限，避免平台检测异常）
     // ============================================================
     function hookTimersWithCompensation() {
         var origSetInterval = window.setInterval;
@@ -159,7 +191,8 @@
                     return origSetInterval.call(window, function () { }, delay);
                 }
             }
-            if (delay >= 500 && delay <= 5000) {
+            // 只对 0.5s~3s 的定时器启用补偿（平台计时器通常是1秒）
+            if (delay >= 500 && delay <= 3000) {
                 var startTime = Date.now();
                 var lastFiredTick = 0;
                 var compensatedFn = function () {
@@ -167,7 +200,8 @@
                     var currentTick = Math.floor((now - startTime) / delay);
                     var missed = currentTick - lastFiredTick;
                     if (missed > 1) {
-                        var compensateCount = Math.min(missed, 60);
+                        // 平滑补偿：最多补5次，避免平台检测到跳变
+                        var compensateCount = Math.min(missed, 5);
                         for (var j = 0; j < compensateCount; j++) {
                             try { fn.call(this); } catch (e) { }
                         }
@@ -195,52 +229,91 @@
     }
 
     // ============================================================
-    // 六、核心：video.currentTime 持续推进引擎
-    // ESNAI 用 ckplayer，计时完全基于 video.currentTime
-    // 后台标签页视频暂停后 currentTime 不再增长，这才是计时偏小的根本原因
+    // 六、核心：video.currentTime 持续推进引擎（v9.0 重写）
     // ============================================================
     function startVideoTimeEngine() {
-        var lastKnownTime = 0;
-        var lastUpdateTime = Date.now();
+        var lastKnownTime = -1;  // -1 表示未初始化
+        var lastUpdateTime = 0;
+        var initialized = false;
 
-        function tick() {
+        function waitForVideo() {
             var video = document.querySelector('video');
-            if (!video) return;
-
-            var now = Date.now();
-            var actualSec = getActualSec();
-
-            if (!video.paused && !video.ended) {
-                lastKnownTime = video.currentTime;
-                lastUpdateTime = now;
+            if (!video) {
+                setTimeout(waitForVideo, 1000);
+                return;
             }
 
-            // 如果视频被暂停或后台节流导致currentTime停滞
-            // 计算应该推进的时间量
+            // 等待视频加载到可以获取 currentTime
+            if (video.readyState < 1) {
+                video.addEventListener('loadedmetadata', function () {
+                    initEngine(video);
+                }, { once: true });
+                // 超时保护：5秒后强制初始化
+                setTimeout(function () { if (!initialized) initEngine(video); }, 5000);
+            } else {
+                initEngine(video);
+            }
+        }
+
+        function initEngine(video) {
+            if (initialized) return;
+            initialized = true;
+            STATE.engineReady = true;
+
+            // 从视频当前位置初始化，不从0
+            lastKnownTime = video.currentTime;
+            lastUpdateTime = Date.now();
+
+            log('视频时间引擎初始化: currentTime=' + Math.floor(lastKnownTime) + '秒, 累计学习=' + getActualSec() + '秒');
+
+            // 每2秒检查一次
+            setInterval(function () { tick(video); }, 2000);
+        }
+
+        function tick(video) {
+            var now = Date.now();
+
+            // 视频正在正常播放 → 更新跟踪值
+            if (!video.paused && !video.ended && video.readyState >= 2) {
+                lastKnownTime = video.currentTime;
+                lastUpdateTime = now;
+                STATE.lastKnownVideoTime = video.currentTime;
+                return;
+            }
+
+            // 视频暂停或后台节流导致停滞
             var timeSinceLastUpdate = (now - lastUpdateTime) / 1000;
-            if (timeSinceLastUpdate > 3) {
-                // 视频进度停滞超过3秒，强制推进
+            if (timeSinceLastUpdate > 3 && lastKnownTime >= 0) {
                 var targetTime = lastKnownTime + timeSinceLastUpdate;
                 var duration = video.duration;
+
+                // 不超过视频总时长
                 if (!isNaN(duration) && targetTime > duration) {
                     targetTime = duration;
                 }
+
+                // 推进视频进度
                 if (!isNaN(duration) && targetTime <= duration || isNaN(duration)) {
                     video.currentTime = targetTime;
                     lastKnownTime = targetTime;
                     lastUpdateTime = now;
-                    log('视频进度强制推进:', Math.floor(targetTime), '秒');
+                    STATE.lastKnownVideoTime = targetTime;
+                    log('视频进度推进:', Math.floor(targetTime), '秒 (停滞了', Math.floor(timeSinceLastUpdate), '秒)');
                 }
             }
 
-            // 同时确保视频在播放
+            // 确保视频在播放
             if (STATE.forcePlayEnabled && video.paused && !video.ended) {
                 video.play().catch(function () { });
             }
         }
 
-        // 每2秒检查一次
-        setInterval(tick, 2000);
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', waitForVideo);
+        } else {
+            waitForVideo();
+        }
+
         log('视频时间引擎已启动');
     }
 
@@ -319,24 +392,30 @@
     }
 
     // ============================================================
-    // 八、自动播放
+    // 八、自动播放（更可靠）
     // ============================================================
     function autoPlayOnLoad() {
         function tryAutoPlay() {
+            // 查找所有视频并播放
             document.querySelectorAll('video').forEach(function (v) {
                 if (v.paused && !v.ended) {
                     v.muted = true; v.volume = 0; v.autoplay = true;
                     v.play().catch(function () { });
                 }
             });
+
+            // 点击播放按钮
             ['.play-btn', '.btn-play', '#playBtn', '#play',
                 '.vjs-big-play-button', '.video-play-btn',
                 'button[title="Play"]', 'button[title="播放"]',
                 '.prism-big-play-btn', '.xgplayer-start',
-                '.ckplayer-playswitch', '.ckplayer-play'].forEach(function (sel) {
+                '.ckplayer-playswitch', '.ckplayer-play',
+                '.video-play', '.player-play'].forEach(function (sel) {
                     var btn = document.querySelector(sel);
                     if (btn && btn.offsetParent !== null) btn.click();
                 });
+
+            // iframe 内的视频
             document.querySelectorAll('iframe').forEach(function (iframe) {
                 try {
                     if (iframe.contentDocument) {
@@ -347,8 +426,11 @@
                 } catch (e) { }
             });
         }
-        [1000, 3000, 5000, 10000, 15000].forEach(function (t) { setTimeout(tryAutoPlay, t); });
-        if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', function () { setTimeout(tryAutoPlay, 500); });
+
+        // 多次尝试，覆盖各种加载时序
+        [500, 1000, 2000, 3000, 5000, 8000, 10000, 15000, 20000].forEach(function (t) {
+            setTimeout(tryAutoPlay, t);
+        });
     }
 
     // ============================================================
@@ -468,7 +550,8 @@
                 'timer', 'timerSeconds', 'timerSec', 'countSeconds',
                 'elapsedTime', 'elapsedSec', 'secondCount', 'secCount'];
             knownVars.forEach(function (v) {
-                if (window[v] !== undefined && typeof window[v] === 'number' && window[v] < actualSec) {
+                if (window[v] !== undefined && typeof window[v] === 'number' && window[v] >= 0 && window[v] < actualSec) {
+                    log('刷新计时变量:', v, window[v], '->', actualSec);
                     window[v] = actualSec;
                 }
             });
@@ -500,7 +583,7 @@
                     var vm = el.__vue__;
                     if (vm && vm.$data) {
                         for (var key in vm.$data) {
-                            if (typeof vm.$data[key] === 'number' && vm.$data[key] < actualSec && vm.$data[key] > 0) {
+                            if (typeof vm.$data[key] === 'number' && vm.$data[key] < actualSec && vm.$data[key] >= 0) {
                                 var k = key.toLowerCase();
                                 if (k.indexOf('time') !== -1 || k.indexOf('sec') !== -1 || k.indexOf('study') !== -1) {
                                     vm.$data[key] = actualSec;
@@ -553,7 +636,6 @@
                         if (window[name].play) {
                             setInterval(function () { try { if (STATE.forcePlayEnabled) window[name].play(); } catch (e) { } }, 5000);
                         }
-                        // ckplayer 特有：video属性
                         if (window[name].video) {
                             try { window[name].video.muted = true; window[name].video.play().catch(function () { }); } catch (e) { }
                         }
@@ -579,7 +661,10 @@
     // ============================================================
     function hookPageUnload() {
         window.addEventListener('beforeunload', function (e) { e.stopImmediatePropagation(); }, true);
-        window.addEventListener('unload', function (e) { e.stopImmediatePropagation(); }, true);
+        window.addEventListener('unload', function (e) {
+            saveState();
+            e.stopImmediatePropagation();
+        }, true);
         window.open = function () { return null; };
     }
 
@@ -587,7 +672,11 @@
     // 初始化
     // ============================================================
     function init() {
-        log('========== ESNAI 助手 v8.0 启动 ==========');
+        log('========== ESNAI 助手 v9.0 启动 ==========');
+        log('累计学习时间:', getActualSec(), '秒 (', Math.floor(getActualSec() / 60), '分钟)');
+        if (savedState) {
+            log('已恢复上次状态, startTime:', new Date(savedState.startTime).toLocaleString());
+        }
 
         hookTimersWithCompensation();
         startAntiThrottlingAudio();
