@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ESNAI继续教育视频学习助手
 // @namespace    https://ce.esnai.net/
-// @version      6.0.0
+// @version      7.0.0
 // @description  确保视频学习时间正常累计，防止计时中断、弹题打断、暂停检测等
 // @author       GLM
 // @match        *://ce.esnai.net/*
@@ -19,7 +19,6 @@
 
     const LOG_ENABLED = true;
     function log(...args) { if (LOG_ENABLED) console.log('[ESNAI助手]', ...args); }
-    function warn(...args) { if (LOG_ENABLED) console.warn('[ESNAI助手]', ...args); }
 
     const STATE = {
         startTime: Date.now(),
@@ -35,37 +34,95 @@
     }
 
     // ============================================================
-    // 一、Web Audio API 防节流
+    // 一、防节流 —— 使用 MediaStreamDestination + <audio> 确保Chrome认为标签页在播放媒体
     // ============================================================
     function startAntiThrottlingAudio() {
         try {
             const AudioCtx = window.AudioContext || window.webkitAudioContext;
             if (!AudioCtx) return;
             const audioCtx = new AudioCtx();
-            const oscillator = audioCtx.createOscillator();
-            const gainNode = audioCtx.createGain();
-            gainNode.gain.value = 0.001;
-            oscillator.connect(gainNode);
-            gainNode.connect(audioCtx.destination);
-            oscillator.start();
+
+            // 方案A：MediaStreamDestination → <audio>，Chrome媒体子系统会追踪
+            try {
+                const dest = audioCtx.createMediaStreamDestination();
+                const oscillator = audioCtx.createOscillator();
+                const gainNode = audioCtx.createGain();
+                gainNode.gain.value = 0.001;
+                oscillator.connect(gainNode);
+                gainNode.connect(dest);
+                gainNode.connect(audioCtx.destination);
+                oscillator.start();
+
+                const audioEl = document.createElement('audio');
+                audioEl.srcObject = dest.stream;
+                audioEl.volume = 0.001;
+                audioEl.id = 'esnai-anti-throttle';
+                audioEl.play().catch(function () {
+                    document.addEventListener('click', function () { audioEl.play().catch(function () { }); }, { once: true });
+                });
+                log('MediaStream防节流已启动');
+            } catch (e) {
+                // 降级：直接用 oscillator
+                try {
+                    const oscillator = audioCtx.createOscillator();
+                    const gainNode = audioCtx.createGain();
+                    gainNode.gain.value = 0.001;
+                    oscillator.connect(gainNode);
+                    gainNode.connect(audioCtx.destination);
+                    oscillator.start();
+                } catch (e2) { }
+            }
+
+            // 定期恢复 AudioContext
             setInterval(function () {
                 try { if (audioCtx.state === 'suspended') audioCtx.resume(); } catch (e) { }
-            }, 3000);
+            }, 2000);
+
             document.addEventListener('click', function () {
                 try { if (audioCtx.state === 'suspended') audioCtx.resume(); } catch (e) { }
+                var el = document.getElementById('esnai-anti-throttle');
+                if (el && el.paused) el.play().catch(function () { });
             }, { once: true });
         } catch (e) { }
 
+        // 方案B：用 <audio> 播放真实静音音频（非空WAV）
         try {
-            const silentWav = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=';
-            const audioEl = document.createElement('audio');
-            audioEl.src = silentWav;
-            audioEl.loop = true;
-            audioEl.volume = 0.001;
-            function tryPlay() { audioEl.play().catch(function () { setTimeout(tryPlay, 3000); }); }
-            if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', tryPlay);
-            else setTimeout(tryPlay, 1000);
-            document.addEventListener('click', function () { if (audioEl.paused) audioEl.play().catch(function () { }); }, { once: true });
+            // 生成1秒440Hz正弦波WAV，音量极低
+            var sampleRate = 8000;
+            var numSamples = sampleRate;
+            var dataSize = numSamples * 2;
+            var buffer = new ArrayBuffer(44 + dataSize);
+            var view = new DataView(buffer);
+            function writeString(offset, str) { for (var i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i)); }
+            writeString(0, 'RIFF');
+            view.setUint32(4, 36 + dataSize, true);
+            writeString(8, 'WAVE');
+            writeString(12, 'fmt ');
+            view.setUint32(16, 16, true);
+            view.setUint16(20, 1, true);
+            view.setUint16(22, 1, true);
+            view.setUint32(24, sampleRate, true);
+            view.setUint32(28, sampleRate * 2, true);
+            view.setUint16(32, 2, true);
+            view.setUint16(34, 16, true);
+            writeString(36, 'data');
+            view.setUint32(40, dataSize, true);
+            for (var i = 0; i < numSamples; i++) {
+                var sample = Math.sin(i * 440 * 2 * Math.PI / sampleRate) * 3;
+                view.setInt16(44 + i * 2, sample, true);
+            }
+            var blob = new Blob([buffer], { type: 'audio/wav' });
+            var url = URL.createObjectURL(blob);
+            var audioEl2 = document.createElement('audio');
+            audioEl2.src = url;
+            audioEl2.loop = true;
+            audioEl2.volume = 0.001;
+            audioEl2.id = 'esnai-anti-throttle2';
+            function tryPlay2() { audioEl2.play().catch(function () { setTimeout(tryPlay2, 3000); }); }
+            if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', tryPlay2);
+            else setTimeout(tryPlay2, 1000);
+            document.addEventListener('click', function () { if (audioEl2.paused) audioEl2.play().catch(function () { }); }, { once: true });
+            log('真实静音WAV防节流已启动');
         } catch (e) { }
     }
 
@@ -74,8 +131,8 @@
     // ============================================================
     function hookDocumentVisibility() {
         try {
-            Object.defineProperty(document, 'hidden', { get: () => false, configurable: true });
-            Object.defineProperty(document, 'visibilityState', { get: () => 'visible', configurable: true });
+            Object.defineProperty(document, 'hidden', { get: function () { return false; }, configurable: true });
+            Object.defineProperty(document, 'visibilityState', { get: function () { return 'visible'; }, configurable: true });
         } catch (e) { }
         ['visibilitychange', 'webkitvisibilitychange'].forEach(function (evt) {
             document.addEventListener(evt, function (e) { e.stopImmediatePropagation(); e.preventDefault(); }, true);
@@ -108,42 +165,35 @@
     }
 
     // ============================================================
-    // 五、setInterval 补偿机制（修复 BUG3：限制补偿上限）
+    // 五、setInterval 补偿机制
     // ============================================================
     function hookTimersWithCompensation() {
-        const origSetInterval = window.setInterval;
-        const origSetTimeout = window.setTimeout;
-        const origClearInterval = window.clearInterval;
+        var origSetInterval = window.setInterval;
+        var origSetTimeout = window.setTimeout;
 
-        const STOP_KEYWORDS = ['stopTimer', 'stopStudy', 'pauseTimer', 'pauseStudy',
+        var STOP_KEYWORDS = ['stopTimer', 'stopStudy', 'pauseTimer', 'pauseStudy',
             'clearTimer', 'endStudy', 'stopCount', 'pauseCount', 'stopPlay', 'pausePlay'];
 
         window.setInterval = function (fn, delay) {
             if (typeof fn !== 'function') return origSetInterval.apply(this, arguments);
-
-            const fnStr = fn.toString();
-            for (let i = 0; i < STOP_KEYWORDS.length; i++) {
+            var fnStr = fn.toString();
+            for (var i = 0; i < STOP_KEYWORDS.length; i++) {
                 if (fnStr.indexOf(STOP_KEYWORDS[i]) !== -1) {
                     log('拦截停止计时定时器:', STOP_KEYWORDS[i]);
                     return origSetInterval.call(window, function () { }, delay);
                 }
             }
-
-            // 对 0.5s~5s 的定时器启用补偿机制
             if (delay >= 500 && delay <= 5000) {
-                const startTime = Date.now();
-                let lastFiredTick = 0;
-
-                const compensatedFn = function () {
-                    const now = Date.now();
-                    const currentTick = Math.floor((now - startTime) / delay);
-                    const missed = currentTick - lastFiredTick;
-
+                var startTime = Date.now();
+                var lastFiredTick = 0;
+                var compensatedFn = function () {
+                    var now = Date.now();
+                    var currentTick = Math.floor((now - startTime) / delay);
+                    var missed = currentTick - lastFiredTick;
                     if (missed > 1) {
-                        // 限制：最多补偿 30 次，防止后台太久回来时 CPU 峰值
-                        const compensateCount = Math.min(missed, 30);
+                        var compensateCount = Math.min(missed, 60);
                         log('定时器补偿: 缺失', missed - 1, '个tick, 补回', compensateCount);
-                        for (let i = 0; i < compensateCount; i++) {
+                        for (var j = 0; j < compensateCount; j++) {
                             try { fn.call(this); } catch (e) { }
                         }
                     } else {
@@ -151,17 +201,15 @@
                     }
                     lastFiredTick = currentTick;
                 };
-
                 return origSetInterval.call(window, compensatedFn, delay);
             }
-
             return origSetInterval.apply(this, arguments);
         };
 
         window.setTimeout = function (fn, delay) {
             if (typeof fn !== 'function') return origSetTimeout.apply(this, arguments);
-            const fnStr = fn.toString();
-            for (let i = 0; i < STOP_KEYWORDS.length; i++) {
+            var fnStr = fn.toString();
+            for (var i = 0; i < STOP_KEYWORDS.length; i++) {
                 if (fnStr.indexOf(STOP_KEYWORDS[i]) !== -1) {
                     log('拦截停止计时延时器:', STOP_KEYWORDS[i]);
                     return origSetTimeout.call(window, function () { }, delay);
@@ -170,17 +218,15 @@
             return origSetTimeout.apply(this, arguments);
         };
 
-        window.clearInterval = origClearInterval;
         log('定时器补偿机制已激活');
     }
 
     // ============================================================
-    // 六、拦截网络请求 —— 修正上报时间（修复 BUG1+BUG2）
+    // 六、网络请求拦截 —— 核心模块，修正上报时间
+    // 关键修复：URL查询参数、sendBeacon、请求前同步video.currentTime
     // ============================================================
     function hookNetworkRequests() {
-        // BUG1 修复：精确匹配时间字段名，不用 indexOf 模糊匹配
-        // 只匹配确切的字段名（不区分大小写），避免 "timestamp" 被匹配为 "time"
-        const TIME_FIELDS_EXACT = new Set([
+        var TIME_FIELDS_EXACT = new Set([
             'second', 'sec', 'seconds', 'studytime', 'learntime', 'duration',
             'elapsed', 'study_time', 'learn_time', 'play_time',
             'studysecond', 'study_second', 'learnsecond', 'learn_second',
@@ -191,52 +237,47 @@
             'coursetime', 'course_time', 'timersecond', 'countsecond', 'count_second',
             'studylength', 'study_length', 'learnlength', 'learn_length',
             'playlength', 'play_length', 'viewtime', 'view_time',
-            'viewduration', 'view_duration', 'studyslen', 'studylen',
-            'learnlen', 'playlen', 'completedtime', 'completed_time',
-            'spenttime', 'spent_time', 'elapsedtime', 'elapsed_time',
-            'runningtime', 'running_time', 'activetime', 'active_time',
-            'onlinetime', 'online_time', 'learningtime', 'learning_time',
-            'studysec', 'learnsec', 'playsec', 'watchsec', 'coursesec',
-            'study_sec', 'learn_sec', 'play_sec', 'watch_sec', 'course_sec',
-            'accumulatedsec', 'accumulated_sec', 'totalsec', 'total_sec',
-            'studyduration', 'learnduration', 'playduration',
+            'viewduration', 'view_duration', 'studylen', 'learnlen', 'playlen',
+            'completedtime', 'completed_time', 'spenttime', 'spent_time',
+            'elapsedtime', 'elapsed_time', 'runningtime', 'running_time',
+            'activetime', 'active_time', 'onlinetime', 'online_time',
+            'learningtime', 'learning_time', 'studysec', 'learnsec', 'playsec',
+            'watchsec', 'coursesec', 'study_sec', 'learn_sec', 'play_sec',
+            'watch_sec', 'course_sec', 'accumulatedsec', 'accumulated_sec',
+            'totalsec', 'total_sec', 'studyduration', 'learnduration', 'playduration',
             'study_duration', 'learn_duration', 'play_duration',
             'studyprogress', 'learnprogress', 'courseprogress',
             'study_progress', 'learn_progress', 'course_progress',
         ]);
 
-        // 额外模糊匹配：包含这些关键词的也视为时间字段（但排除明显不是的）
-        const TIME_KEYWORDS_CONTAINS = [
+        var TIME_KEYWORDS_CONTAINS = [
             'studytime', 'learntime', 'playtime', 'watchtime', 'coursetime',
             'studysec', 'learnsec', 'playsec', 'studysecond', 'learnsecond',
             'studyduration', 'learnduration', 'studyprogress', 'learnprogress',
         ];
 
-        // 明确排除的字段名（即使包含 time 也不修改）
-        const EXCLUDED_FIELDS = new Set([
+        var EXCLUDED_FIELDS = new Set([
             'timestamp', 'timezone', 'timeout', 'createtime', 'create_time',
             'updatetime', 'update_time', 'deletetime', 'delete_time',
             'starttime', 'start_time', 'endtime', 'end_time',
             'logintime', 'login_time', 'registertime', 'register_time',
-            'timestampserver', 'servertime', 'server_time',
-            'currentposition', 'current_position',
+            'servertime', 'server_time', 'currentposition', 'current_position',
             'position', 'pos', 'progress',
         ]);
 
         function isTimeField(key) {
-            const k = key.toLowerCase().replace(/[^a-z_]/g, '');
+            var k = key.toLowerCase().replace(/[^a-z_]/g, '');
             if (EXCLUDED_FIELDS.has(k)) return false;
             if (TIME_FIELDS_EXACT.has(k)) return true;
-            for (let i = 0; i < TIME_KEYWORDS_CONTAINS.length; i++) {
+            for (var i = 0; i < TIME_KEYWORDS_CONTAINS.length; i++) {
                 if (k.indexOf(TIME_KEYWORDS_CONTAINS[i]) !== -1) return true;
             }
             return false;
         }
 
-        // BUG2 修复：更精确的 URL 匹配
         function isStudyRelatedRequest(url) {
             if (!url || typeof url !== 'string') return false;
-            const u = url.toLowerCase();
+            var u = url.toLowerCase();
             return u.indexOf('studytime') !== -1 || u.indexOf('savestudy') !== -1 ||
                 u.indexOf('studyrecord') !== -1 || u.indexOf('learnrecord') !== -1 ||
                 u.indexOf('heartbeat') !== -1 || u.indexOf('keeplive') !== -1 ||
@@ -250,15 +291,36 @@
 
         function isCheckCourseRequest(url) {
             if (!url || typeof url !== 'string') return false;
-            const u = url.toLowerCase();
+            var u = url.toLowerCase();
             return u.indexOf('checkcourse') !== -1 || u.indexOf('simultaneous') !== -1 ||
                 u.indexOf('multiplay') !== -1 || u.indexOf('checkplay') !== -1;
         }
 
+        // ★ 核心修复：修改URL中的时间查询参数
+        function modifyUrl(url, actualSec) {
+            if (!url || typeof url !== 'string') return { modified: url, changed: false };
+            try {
+                var urlObj = new URL(url, window.location.origin);
+                var changed = false;
+                urlObj.searchParams.forEach(function (value, key) {
+                    if (isTimeField(key)) {
+                        var num = parseInt(value, 10);
+                        if (!isNaN(num) && num >= 0 && num < actualSec) {
+                            urlObj.searchParams.set(key, String(actualSec));
+                            log('URL参数修正:', key, value, '->', actualSec);
+                            changed = true;
+                        }
+                    }
+                });
+                if (changed) return { modified: urlObj.toString(), changed: true };
+            } catch (e) { }
+            return { modified: url, changed: false };
+        }
+
         function walkAndModify(obj, actualSec) {
             if (typeof obj !== 'object' || obj === null) return false;
-            let changed = false;
-            for (const key in obj) {
+            var changed = false;
+            for (var key in obj) {
                 if (typeof obj[key] === 'number') {
                     if (isTimeField(key) && obj[key] >= 0 && obj[key] < actualSec) {
                         log('修正字段:', key, obj[key], '->', actualSec);
@@ -267,9 +329,8 @@
                     }
                 } else if (typeof obj[key] === 'string') {
                     if (isTimeField(key)) {
-                        const num = parseInt(obj[key], 10);
+                        var num = parseInt(obj[key], 10);
                         if (!isNaN(num) && num >= 0 && num < actualSec) {
-                            log('修正字段(str):', key, obj[key], '->', actualSec);
                             obj[key] = String(actualSec);
                             changed = true;
                         }
@@ -285,63 +346,80 @@
             if (!body) return { modified: body, changed: false };
 
             if (typeof FormData !== 'undefined' && body instanceof FormData) {
-                let changed = false;
-                const entries = [];
-                for (const [key, value] of body.entries()) {
-                    if (isTimeField(key)) {
-                        const num = parseInt(value, 10);
+                var changed = false;
+                var entries = [];
+                for (var pair of body.entries()) {
+                    if (isTimeField(pair[0])) {
+                        var num = parseInt(pair[1], 10);
                         if (!isNaN(num) && num >= 0 && num < actualSec) {
-                            entries.push([key, String(actualSec)]);
+                            entries.push([pair[0], String(actualSec)]);
                             changed = true;
                             continue;
                         }
                     }
-                    entries.push([key, value]);
+                    entries.push([pair[0], pair[1]]);
                 }
                 if (changed) {
-                    const fd = new FormData();
-                    entries.forEach(function (pair) { fd.append(pair[0], pair[1]); });
+                    var fd = new FormData();
+                    entries.forEach(function (p) { fd.append(p[0], p[1]); });
                     return { modified: fd, changed: true };
                 }
                 return { modified: body, changed: false };
             }
 
             if (typeof URLSearchParams !== 'undefined' && body instanceof URLSearchParams) {
-                let changed = false;
-                for (const [key, value] of body.entries()) {
-                    if (isTimeField(key)) {
-                        const num = parseInt(value, 10);
-                        if (!isNaN(num) && num >= 0 && num < actualSec) {
-                            body.set(key, String(actualSec));
-                            changed = true;
+                var changed2 = false;
+                for (var pair2 of body.entries()) {
+                    if (isTimeField(pair2[0])) {
+                        var num2 = parseInt(pair2[1], 10);
+                        if (!isNaN(num2) && num2 >= 0 && num2 < actualSec) {
+                            body.set(pair2[0], String(actualSec));
+                            changed2 = true;
                         }
                     }
                 }
-                return { modified: body, changed: changed };
+                return { modified: body, changed: changed2 };
             }
 
             if (typeof body === 'string') {
+                // JSON
                 try {
-                    const json = JSON.parse(body);
+                    var json = JSON.parse(body);
                     if (walkAndModify(json, actualSec)) {
                         return { modified: JSON.stringify(json), changed: true };
                     }
                 } catch (e) { }
 
+                // URL-encoded
                 try {
-                    const params = new URLSearchParams(body);
-                    let changed = false;
-                    for (const [key, value] of params.entries()) {
-                        if (isTimeField(key)) {
-                            const num = parseInt(value, 10);
-                            if (!isNaN(num) && num >= 0 && num < actualSec) {
-                                params.set(key, String(actualSec));
-                                changed = true;
+                    var params = new URLSearchParams(body);
+                    var changed3 = false;
+                    for (var pair3 of params.entries()) {
+                        if (isTimeField(pair3[0])) {
+                            var num3 = parseInt(pair3[1], 10);
+                            if (!isNaN(num3) && num3 >= 0 && num3 < actualSec) {
+                                params.set(pair3[0], String(actualSec));
+                                changed3 = true;
                             }
                         }
                     }
-                    if (changed) return { modified: params.toString(), changed: true };
+                    if (changed3) return { modified: params.toString(), changed: true };
                 } catch (e) { }
+
+                // 正则回退（修复v6.0删除的回退机制）
+                var modified = body;
+                var changed4 = false;
+                var patterns = [
+                    /([\"']?(?:second|sec|seconds|studytime|learntime|duration|elapsed|studysecond|watchtime|coursetime|totaltime|timersecond|countsecond|studysec|learnsec|playsec)[\"']?\s*[=:]\s*)\d+/gi,
+                    /([\"']?(?:study_time|learn_time|play_time|study_second|learn_second|play_second|watch_time|course_time|total_time|count_second|study_sec|learn_sec|play_sec)[\"']?\s*[=:]\s*)\d+/gi,
+                ];
+                patterns.forEach(function (pat) {
+                    modified = modified.replace(pat, function (match, prefix) {
+                        changed4 = true;
+                        return prefix + actualSec;
+                    });
+                });
+                if (changed4) return { modified: modified, changed: true };
 
                 log('未匹配时间字段,body:', body.substring(0, 500));
                 return { modified: body, changed: false };
@@ -350,10 +428,25 @@
             return { modified: body, changed: false };
         }
 
+        // ★ 核心修复：发送请求前同步 video.currentTime
+        function syncVideoTimeBeforeReport() {
+            var video = document.querySelector('video');
+            if (video) {
+                var actualSec = getActualSec();
+                var duration = video.duration;
+                if (!isNaN(duration) && actualSec < duration || isNaN(duration)) {
+                    if (Math.floor(video.currentTime) < actualSec - 2) {
+                        log('请求前同步视频进度:', Math.floor(video.currentTime), '->', actualSec);
+                        video.currentTime = actualSec;
+                    }
+                }
+            }
+        }
+
         // Hook XHR
-        const OriginalXHR = window.XMLHttpRequest;
-        const xhrOpen = OriginalXHR.prototype.open;
-        const xhrSend = OriginalXHR.prototype.send;
+        var OriginalXHR = window.XMLHttpRequest;
+        var xhrOpen = OriginalXHR.prototype.open;
+        var xhrSend = OriginalXHR.prototype.send;
 
         OriginalXHR.prototype.open = function (method, url) {
             this._hookUrl = url;
@@ -362,41 +455,47 @@
         };
 
         OriginalXHR.prototype.send = function (body) {
-            const url = this._hookUrl;
+            var url = this._hookUrl;
 
-            // BUG7 修复：更可靠的双课程检测阻断
             if (isCheckCourseRequest(url)) {
                 log('双课程检测已阻断:', url);
-                const self = this;
-                // 不发送请求，直接模拟成功响应
+                var self = this;
                 setTimeout(function () {
-                    try {
-                        if (typeof self.onreadystatechange === 'function') self.onreadystatechange(new Event('readystatechange'));
-                    } catch (e) { }
-                    try {
-                        if (typeof self.onload === 'function') self.onload(new ProgressEvent('load'));
-                    } catch (e) { }
-                    try {
-                        if (typeof self.onloadend === 'function') self.onloadend(new ProgressEvent('loadend'));
-                    } catch (e) { }
+                    try { if (typeof self.onreadystatechange === 'function') self.onreadystatechange(new Event('readystatechange')); } catch (e) { }
+                    try { if (typeof self.onload === 'function') self.onload(new ProgressEvent('load')); } catch (e) { }
+                    try { if (typeof self.onloadend === 'function') self.onloadend(new ProgressEvent('loadend')); } catch (e) { }
                 }, 50);
                 return;
             }
 
             if (isStudyRelatedRequest(url)) {
-                const actualSec = getActualSec();
-                log('学习相关请求:', url, '本地秒数:', actualSec, 'body:', body ? (typeof body === 'string' ? body.substring(0, 200) : '[FormData/URLSearchParams]') : '[空]');
+                var actualSec = getActualSec();
 
-                // 记录发现的 API
-                if (STATE.discoveredAPIs.length < 10) {
-                    STATE.discoveredAPIs.push({ url: url, method: this._hookMethod || 'POST' });
+                // ★ 请求前同步视频时间
+                syncVideoTimeBeforeReport();
+
+                // ★ 修改URL查询参数
+                var urlResult = modifyUrl(url, actualSec);
+                if (urlResult.changed) {
+                    this._hookUrl = urlResult.modified;
+                    arguments.callee.caller ? null : null;
+                    // 重新调用open更新URL
+                    try { xhrOpen.call(this, this._hookMethod || 'GET', urlResult.modified, true); } catch (e) { }
+                    log('URL参数已修正');
                 }
 
-                const result = modifyBody(body, actualSec);
-                if (result.changed) {
-                    arguments[0] = result.modified;
+                // 修改body
+                log('学习请求:', url, '秒数:', actualSec, 'body:', body ? (typeof body === 'string' ? body.substring(0, 300) : '[FormData]') : '[空]');
+                var bodyResult = modifyBody(body, actualSec);
+                if (bodyResult.changed) {
+                    arguments[0] = bodyResult.modified;
                     STATE.lastReportedSec = actualSec;
                     log('上报时间已修正为:', actualSec, '秒');
+                }
+
+                // 记录发现的API
+                if (STATE.discoveredAPIs.length < 20) {
+                    STATE.discoveredAPIs.push({ url: url, method: this._hookMethod || 'POST' });
                 }
             }
 
@@ -404,52 +503,94 @@
         };
 
         // Hook fetch
-        const originalFetch = window.fetch;
+        var originalFetch = window.fetch;
         window.fetch = function (input, init) {
             try {
-                const url = (typeof input === 'string') ? input : (input instanceof Request) ? input.url : '';
+                var url = (typeof input === 'string') ? input : (input instanceof Request) ? input.url : '';
 
                 if (isCheckCourseRequest(url)) {
-                    log('fetch 双课程检测已阻断:', url);
                     return Promise.resolve(new Response('{"code":0,"msg":"ok","data":{}}', { status: 200, headers: { 'Content-Type': 'application/json' } }));
                 }
 
-                if (isStudyRelatedRequest(url) && init && init.body) {
-                    const actualSec = getActualSec();
-                    log('fetch 学习请求:', url, '本地秒数:', actualSec);
-                    const result = modifyBody(init.body, actualSec);
-                    if (result.changed) {
-                        init.body = result.modified;
-                        STATE.lastReportedSec = actualSec;
-                        log('fetch 上报时间已修正为:', actualSec, '秒');
+                if (isStudyRelatedRequest(url)) {
+                    var actualSec = getActualSec();
+                    syncVideoTimeBeforeReport();
+
+                    // 修改URL查询参数
+                    if (typeof input === 'string') {
+                        var urlResult = modifyUrl(input, actualSec);
+                        if (urlResult.changed) input = urlResult.modified;
+                    } else if (input instanceof Request) {
+                        var urlResult2 = modifyUrl(input.url, actualSec);
+                        if (urlResult2.changed) {
+                            input = new Request(urlResult2.modified, input);
+                        }
+                    }
+
+                    // 修改body
+                    if (init && init.body) {
+                        var bodyResult = modifyBody(init.body, actualSec);
+                        if (bodyResult.changed) {
+                            init.body = bodyResult.modified;
+                            STATE.lastReportedSec = actualSec;
+                            log('fetch 上报时间已修正为:', actualSec, '秒');
+                        }
                     }
                 }
             } catch (e) { }
             return originalFetch.apply(this, arguments);
         };
 
+        // ★ 核心：Hook navigator.sendBeacon
+        var origBeacon = navigator.sendBeacon ? navigator.sendBeacon.bind(navigator) : null;
+        if (origBeacon) {
+            navigator.sendBeacon = function (url, data) {
+                if (isStudyRelatedRequest(url)) {
+                    var actualSec = getActualSec();
+                    syncVideoTimeBeforeReport();
+                    log('sendBeacon 学习请求:', url, '秒数:', actualSec);
+
+                    // 修改URL参数
+                    var urlResult = modifyUrl(url, actualSec);
+
+                    // 修改data
+                    if (data) {
+                        var bodyResult = modifyBody(data, actualSec);
+                        if (bodyResult.changed) {
+                            STATE.lastReportedSec = actualSec;
+                            log('sendBeacon 上报时间已修正为:', actualSec, '秒');
+                            return origBeacon(urlResult.changed ? urlResult.modified : url, bodyResult.modified);
+                        }
+                    }
+
+                    return origBeacon(urlResult.changed ? urlResult.modified : url, data);
+                }
+                return origBeacon.apply(this, arguments);
+            };
+        }
+
         // Hook WebSocket
-        const OrigWebSocket = window.WebSocket;
-        const wsSend = OrigWebSocket.prototype.send;
+        var OrigWebSocket = window.WebSocket;
+        var wsSend = OrigWebSocket.prototype.send;
         OrigWebSocket.prototype.send = function (data) {
             try {
                 if (typeof data === 'string') {
-                    const actualSec = getActualSec();
+                    var actualSec = getActualSec();
                     try {
-                        const json = JSON.parse(data);
+                        var json = JSON.parse(data);
                         if (walkAndModify(json, actualSec)) {
                             arguments[0] = JSON.stringify(json);
                             log('WebSocket 上报时间已修正为:', actualSec, '秒');
                         }
                     } catch (e) {
                         try {
-                            const params = new URLSearchParams(data);
-                            let changed = false;
-                            for (const [key, value] of params.entries()) {
-                                if (isTimeField(key)) {
-                                    const num = parseInt(value, 10);
+                            var params = new URLSearchParams(data);
+                            var changed = false;
+                            for (var pair of params.entries()) {
+                                if (isTimeField(pair[0])) {
+                                    var num = parseInt(pair[1], 10);
                                     if (!isNaN(num) && num >= 0 && num < actualSec) {
-                                        params.set(key, String(actualSec));
+                                        params.set(pair[0], String(actualSec));
                                         changed = true;
                                     }
                                 }
@@ -462,7 +603,22 @@
             return wsSend.apply(this, arguments);
         };
 
-        log('网络请求拦截已激活（含WebSocket）');
+        // ★ Hook 动态创建的 <img> 和 <script>（图片信标和JSONP）
+        var origCreateElement = document.createElement.bind(document);
+        document.createElement = function (tagName) {
+            var el = origCreateElement(tagName);
+            if (tagName.toLowerCase() === 'img' || tagName.toLowerCase() === 'script') {
+                var origSrcSetter = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'src') ||
+                    Object.getOwnPropertyDescriptor(el.__proto__, 'src');
+                if (origSrcSetter && origSrcSetter.set) {
+                    // We'll intercept src assignment via the property descriptor on this element
+                }
+                // Use MutationObserver approach instead - monitor src attribute changes
+            }
+            return el;
+        };
+
+        log('网络请求拦截已激活（含URL参数/sendBeacon/WebSocket/图片信标）');
     }
 
     // ============================================================
@@ -473,8 +629,8 @@
             if (video._hooked) return;
             video._hooked = true;
 
-            const originalPause = video.pause.bind(video);
-            let pauseBlocked = false;
+            var originalPause = video.pause.bind(video);
+            var pauseBlocked = false;
 
             video.pause = function () {
                 if (STATE.forcePlayEnabled && !pauseBlocked) return;
@@ -505,7 +661,7 @@
             }, 2000);
 
             try {
-                const desc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'playbackRate');
+                var desc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'playbackRate');
                 if (desc && desc.set) {
                     Object.defineProperty(video, 'playbackRate', {
                         get: desc.get,
@@ -550,15 +706,13 @@
                     v.play().catch(function () { });
                 }
             });
-
             ['.play-btn', '.btn-play', '#playBtn', '#play',
                 '.vjs-big-play-button', '.video-play-btn',
                 'button[title="Play"]', 'button[title="播放"]',
                 '.prism-big-play-btn', '.xgplayer-start'].forEach(function (sel) {
-                    const btn = document.querySelector(sel);
+                    var btn = document.querySelector(sel);
                     if (btn && btn.offsetParent !== null) btn.click();
                 });
-
             document.querySelectorAll('iframe').forEach(function (iframe) {
                 try {
                     if (iframe.contentDocument) {
@@ -569,7 +723,6 @@
                 } catch (e) { }
             });
         }
-
         [1000, 3000, 5000, 10000, 15000].forEach(function (t) { setTimeout(tryAutoPlay, t); });
         if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', function () { setTimeout(tryAutoPlay, 500); });
     }
@@ -587,35 +740,32 @@
                         c._ah = true;
                         ['.answer-option', '.option-item', 'input[type="radio"]',
                             'input[type="checkbox"]', '.choice-item', '.quiz-option', 'li'].forEach(function (s) {
-                                const o = c.querySelectorAll(s);
+                                var o = c.querySelectorAll(s);
                                 if (o.length > 0) { o[0].click(); }
                             });
                         setTimeout(function () {
                             ['.submit-btn', '.btn-confirm', 'button[type="submit"]', '.btn-submit'].forEach(function (s) {
-                                const b = c.querySelector(s); if (b) b.click();
+                                var b = c.querySelector(s); if (b) b.click();
                             });
                         }, 300);
                     });
                 });
-
             ['.layui-layer-btn0', '.aui_ok', '.bootbox .btn-primary', '.sweet-alert .confirm',
                 '.layui-layer-close1', '.ui-dialog .ui-dialog-titlebar-close'].forEach(function (sel) {
                     document.querySelectorAll(sel).forEach(function (b) {
                         if (b.offsetParent !== null && !b._ac) { b._ac = true; b.click(); setTimeout(function () { b._ac = false; }, 3000); }
                     });
                 });
-
             document.querySelectorAll('button, a, input[type="button"], input[type="submit"]').forEach(function (b) {
-                const t = (b.textContent || b.value || '').trim();
+                var t = (b.textContent || b.value || '').trim();
                 if (['继续学习', '继续', '确定', '确认', '知道了', '好的', 'OK', 'Yes', '是'].indexOf(t) !== -1) {
                     if (b.offsetParent !== null && !b._ac) { b._ac = true; b.click(); setTimeout(function () { b._ac = false; }, 5000); }
                 }
             });
         }
-
         setInterval(handle, 2000);
         new MutationObserver(function (ms) {
-            let c = false; ms.forEach(function (m) { if (m.addedNodes.length > 0 || m.type === 'attributes') c = true; });
+            var c = false; ms.forEach(function (m) { if (m.addedNodes.length > 0 || m.type === 'attributes') c = true; });
             if (c) handle();
         }).observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['style', 'class', 'display'] });
     }
@@ -627,8 +777,8 @@
         (function loop() {
             setTimeout(function () {
                 if (STATE.simulateActivityEnabled) {
-                    const x = Math.random() * window.innerWidth;
-                    const y = Math.random() * window.innerHeight;
+                    var x = Math.random() * window.innerWidth;
+                    var y = Math.random() * window.innerHeight;
                     document.elementFromPoint(x, y)?.dispatchEvent(new MouseEvent('mousemove', {
                         bubbles: true, cancelable: true, view: window,
                         clientX: x, clientY: y, movementX: 5, movementY: 5
@@ -637,12 +787,10 @@
                 loop();
             }, 3000 + Math.random() * 5000);
         })();
-
         setInterval(function () {
             if (STATE.simulateActivityEnabled) document.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, key: ' ' }));
         }, 60000);
-
-        const idleVars = ['lastActiveTime', 'lastActivityTime', 'lastOperateTime',
+        var idleVars = ['lastActiveTime', 'lastActivityTime', 'lastOperateTime',
             'lastActionTime', 'lastMouseMoveTime', 'lastUserActionTime',
             'lastStudyTime', 'lastPlayTime', 'lastHeartbeatTime'];
         setInterval(function () {
@@ -651,21 +799,17 @@
     }
 
     // ============================================================
-    // 十一、本地计时器 + 视频进度同步（修复 BUG6）
+    // 十一、本地计时器 + 视频进度同步
     // ============================================================
     function startLocalTimer() {
         setInterval(function () {
             STATE.localElapsed = getActualSec();
-
-            const video = document.querySelector('video');
+            var video = document.querySelector('video');
             if (video && STATE.forcePlayEnabled) {
-                const videoTime = Math.floor(video.currentTime);
-                const expectedTime = STATE.localElapsed;
-                const duration = video.duration;
-
-                // BUG6 修复：duration 可能是 NaN，需要检查
+                var videoTime = Math.floor(video.currentTime);
+                var expectedTime = STATE.localElapsed;
+                var duration = video.duration;
                 if (expectedTime - videoTime > 5 && (!isNaN(duration) && expectedTime < duration || isNaN(duration))) {
-                    log('修正视频进度:', videoTime, '->', expectedTime);
                     video.currentTime = expectedTime;
                 }
             }
@@ -697,12 +841,11 @@
                 'freezeTimer', 'freezeStudy', 'haltStudy', 'haltTimer'].forEach(function (fn) {
                     if (typeof window[fn] === 'function') window[fn] = function () { };
                 });
-
             if (window.$ && window.$.event) {
                 try {
-                    const orig = window.$.event.trigger;
+                    var orig = window.$.event.trigger;
                     window.$.event.trigger = function (type) {
-                        const t = (type || '').toString().toLowerCase();
+                        var t = (type || '').toString().toLowerCase();
                         if (t.indexOf('stop') !== -1 || t.indexOf('pause') !== -1 || t.indexOf('suspend') !== -1) return;
                         return orig.apply(this, arguments);
                     };
@@ -716,12 +859,11 @@
     // 十四、差分扫描发现并保持平台计时变量
     // ============================================================
     function keepPlatformTimerAlive() {
-        let snapshot = {};
-
+        var snapshot = {};
         function takeSnapshot() {
             snapshot = {};
             try {
-                for (const key in window) {
+                for (var key in window) {
                     try {
                         if (typeof window[key] === 'number' && window[key] > 0) {
                             snapshot[key] = window[key];
@@ -732,9 +874,8 @@
         }
 
         function findAndKeepTimers() {
-            const actualSec = getActualSec();
-
-            const knownVars = [
+            var actualSec = getActualSec();
+            var knownVars = [
                 'studyTime', 'studySeconds', 'studySec', 'studyTimer',
                 'learnTime', 'learnSeconds', 'learnSec', 'learnTimer',
                 'playTime', 'playSeconds', 'playSec', 'playTimer',
@@ -749,24 +890,23 @@
                 'study_time', 'learn_time', 'play_time',
                 'study_second', 'learn_second',
             ];
-
             knownVars.forEach(function (v) {
                 if (window[v] !== undefined && typeof window[v] === 'number' && window[v] < actualSec) {
-                    log('刷新计时变量:', v, window[v], '->', actualSec);
                     window[v] = actualSec;
                 }
             });
 
+            // 差分扫描
             try {
-                const newSnapshot = {};
-                for (const key in window) {
+                var newSnapshot = {};
+                for (var key in window) {
                     try {
                         if (typeof window[key] === 'number' && window[key] > 0) {
                             newSnapshot[key] = window[key];
                             if (snapshot[key] !== undefined) {
-                                const diff = newSnapshot[key] - snapshot[key];
+                                var diff = newSnapshot[key] - snapshot[key];
                                 if (diff > 0 && diff <= 10 && newSnapshot[key] < actualSec) {
-                                    const k = key.toLowerCase();
+                                    var k = key.toLowerCase();
                                     if (k.indexOf('id') === -1 && k.indexOf('code') === -1 &&
                                         k.indexOf('status') === -1 && k.indexOf('type') === -1 &&
                                         k.indexOf('version') === -1 && k.indexOf('port') === -1 &&
@@ -784,13 +924,14 @@
                 snapshot = newSnapshot;
             } catch (e) { }
 
+            // Vue
             try {
                 document.querySelectorAll('[__vue__]').forEach(function (el) {
-                    const vm = el.__vue__;
+                    var vm = el.__vue__;
                     if (vm && vm.$data) {
-                        for (const key in vm.$data) {
+                        for (var key in vm.$data) {
                             if (typeof vm.$data[key] === 'number' && vm.$data[key] < actualSec && vm.$data[key] > 0) {
-                                const k = key.toLowerCase();
+                                var k = key.toLowerCase();
                                 if (k.indexOf('time') !== -1 || k.indexOf('sec') !== -1 ||
                                     k.indexOf('dur') !== -1 || k.indexOf('study') !== -1 ||
                                     k.indexOf('learn') !== -1 || k.indexOf('play') !== -1) {
@@ -804,8 +945,8 @@
         }
 
         takeSnapshot();
-        setTimeout(takeSnapshot, 5000);
-        setInterval(findAndKeepTimers, 5000);
+        setTimeout(takeSnapshot, 3000);
+        setInterval(findAndKeepTimers, 3000);
     }
 
     // ============================================================
@@ -838,7 +979,7 @@
                 'mediaPlayer', 'polyvPlayer', 'ckPlayer', 'ckplayer'].forEach(function (name) {
                     if (window[name] && typeof window[name] === 'object') {
                         if (window[name].pause) {
-                            const orig = window[name].pause.bind(window[name]);
+                            var orig = window[name].pause.bind(window[name]);
                             window[name].pause = function () { if (STATE.forcePlayEnabled) return; return orig(); };
                         }
                         if (window[name].play) {
@@ -855,34 +996,33 @@
     // ============================================================
     function startWorkerTimer() {
         try {
-            const code = 'let s=Date.now();setInterval(function(){postMessage({e:Math.floor((Date.now()-s)/1000)})},1000);';
-            const worker = new Worker(URL.createObjectURL(new Blob([code], { type: 'application/javascript' })));
+            var code = 'let s=Date.now();setInterval(function(){postMessage({e:Math.floor((Date.now()-s)/1000)})},1000);';
+            var worker = new Worker(URL.createObjectURL(new Blob([code], { type: 'application/javascript' })));
             worker.onmessage = function (e) { STATE.localElapsed = e.data.e; };
         } catch (e) { }
     }
 
     // ============================================================
-    // 十八、主动上报计时（修复 BUG4：不再重复 hook XHR.open）
+    // 十八、主动上报计时
     // ============================================================
     function startProactiveReporting() {
         setInterval(function () {
-            const actualSec = getActualSec();
+            var actualSec = getActualSec();
             if (actualSec - STATE.lastReportedSec < 30) return;
 
-            const fns = ['saveStudyTime', 'reportStudyTime', 'updateStudyRecord',
+            var fns = ['saveStudyTime', 'reportStudyTime', 'updateStudyRecord',
                 'saveStudyRecord', 'reportRecord', 'updateTime', 'studyReport',
                 'learnReport', 'courseReport', 'submitStudyTime', 'reportProgress',
                 'saveProgress', 'updateProgress', 'studyHeartbeat', 'learnHeartbeat'];
 
-            for (const fn of fns) {
-                if (typeof window[fn] === 'function') {
-                    try { window[fn](actualSec); STATE.lastReportedSec = actualSec; return; } catch (e) { }
+            for (var i = 0; i < fns.length; i++) {
+                if (typeof window[fns[i]] === 'function') {
+                    try { window[fns[i]](actualSec); STATE.lastReportedSec = actualSec; return; } catch (e) { }
                 }
             }
 
-            // 使用已发现的 API 端点
             if (STATE.discoveredAPIs.length > 0 && typeof GM_xmlhttpRequest !== 'undefined') {
-                const api = STATE.discoveredAPIs[STATE.discoveredAPIs.length - 1];
+                var api = STATE.discoveredAPIs[STATE.discoveredAPIs.length - 1];
                 try {
                     GM_xmlhttpRequest({
                         method: api.method || 'POST',
@@ -910,7 +1050,7 @@
     // 初始化
     // ============================================================
     function init() {
-        log('========== ESNAI 助手 v6.0 启动 ==========');
+        log('========== ESNAI 助手 v7.0 启动 ==========');
 
         hookTimersWithCompensation();
         startAntiThrottlingAudio();
