@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ESNAI继续教育视频学习助手
 // @namespace    https://ce.esnai.net/
-// @version      7.0.0
+// @version      8.0.0
 // @description  确保视频学习时间正常累计，防止计时中断、弹题打断、暂停检测等
 // @author       GLM
 // @match        *://ce.esnai.net/*
@@ -17,16 +17,17 @@
 (function () {
     'use strict';
 
-    const LOG_ENABLED = true;
-    function log(...args) { if (LOG_ENABLED) console.log('[ESNAI助手]', ...args); }
+    var LOG_ENABLED = true;
+    function log() { if (LOG_ENABLED) console.log.apply(console, ['[ESNAI助手]'].concat(Array.prototype.slice.call(arguments))); }
 
-    const STATE = {
+    var STATE = {
         startTime: Date.now(),
         localElapsed: 0,
         lastReportedSec: 0,
         forcePlayEnabled: true,
         simulateActivityEnabled: true,
         discoveredAPIs: [],
+        videoTimeOffset: 0,
     };
 
     function getActualSec() {
@@ -34,50 +35,40 @@
     }
 
     // ============================================================
-    // 一、防节流 —— 使用 MediaStreamDestination + <audio> 确保Chrome认为标签页在播放媒体
+    // 一、Web Audio API 防节流
     // ============================================================
     function startAntiThrottlingAudio() {
         try {
-            const AudioCtx = window.AudioContext || window.webkitAudioContext;
+            var AudioCtx = window.AudioContext || window.webkitAudioContext;
             if (!AudioCtx) return;
-            const audioCtx = new AudioCtx();
-
-            // 方案A：MediaStreamDestination → <audio>，Chrome媒体子系统会追踪
+            var audioCtx = new AudioCtx();
             try {
-                const dest = audioCtx.createMediaStreamDestination();
-                const oscillator = audioCtx.createOscillator();
-                const gainNode = audioCtx.createGain();
+                var dest = audioCtx.createMediaStreamDestination();
+                var oscillator = audioCtx.createOscillator();
+                var gainNode = audioCtx.createGain();
                 gainNode.gain.value = 0.001;
                 oscillator.connect(gainNode);
                 gainNode.connect(dest);
                 gainNode.connect(audioCtx.destination);
                 oscillator.start();
-
-                const audioEl = document.createElement('audio');
+                var audioEl = document.createElement('audio');
                 audioEl.srcObject = dest.stream;
                 audioEl.volume = 0.001;
                 audioEl.id = 'esnai-anti-throttle';
                 audioEl.play().catch(function () {
                     document.addEventListener('click', function () { audioEl.play().catch(function () { }); }, { once: true });
                 });
-                log('MediaStream防节流已启动');
             } catch (e) {
-                // 降级：直接用 oscillator
-                try {
-                    const oscillator = audioCtx.createOscillator();
-                    const gainNode = audioCtx.createGain();
-                    gainNode.gain.value = 0.001;
-                    oscillator.connect(gainNode);
-                    gainNode.connect(audioCtx.destination);
-                    oscillator.start();
-                } catch (e2) { }
+                var osc = audioCtx.createOscillator();
+                var gn = audioCtx.createGain();
+                gn.gain.value = 0.001;
+                osc.connect(gn);
+                gn.connect(audioCtx.destination);
+                osc.start();
             }
-
-            // 定期恢复 AudioContext
             setInterval(function () {
                 try { if (audioCtx.state === 'suspended') audioCtx.resume(); } catch (e) { }
             }, 2000);
-
             document.addEventListener('click', function () {
                 try { if (audioCtx.state === 'suspended') audioCtx.resume(); } catch (e) { }
                 var el = document.getElementById('esnai-anti-throttle');
@@ -85,28 +76,18 @@
             }, { once: true });
         } catch (e) { }
 
-        // 方案B：用 <audio> 播放真实静音音频（非空WAV）
         try {
-            // 生成1秒440Hz正弦波WAV，音量极低
             var sampleRate = 8000;
             var numSamples = sampleRate;
             var dataSize = numSamples * 2;
             var buffer = new ArrayBuffer(44 + dataSize);
             var view = new DataView(buffer);
             function writeString(offset, str) { for (var i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i)); }
-            writeString(0, 'RIFF');
-            view.setUint32(4, 36 + dataSize, true);
-            writeString(8, 'WAVE');
-            writeString(12, 'fmt ');
-            view.setUint32(16, 16, true);
-            view.setUint16(20, 1, true);
-            view.setUint16(22, 1, true);
-            view.setUint32(24, sampleRate, true);
-            view.setUint32(28, sampleRate * 2, true);
-            view.setUint16(32, 2, true);
-            view.setUint16(34, 16, true);
-            writeString(36, 'data');
-            view.setUint32(40, dataSize, true);
+            writeString(0, 'RIFF'); view.setUint32(4, 36 + dataSize, true); writeString(8, 'WAVE');
+            writeString(12, 'fmt '); view.setUint32(16, 16, true); view.setUint16(20, 1, true);
+            view.setUint16(22, 1, true); view.setUint32(24, sampleRate, true);
+            view.setUint32(28, sampleRate * 2, true); view.setUint16(32, 2, true);
+            view.setUint16(34, 16, true); writeString(36, 'data'); view.setUint32(40, dataSize, true);
             for (var i = 0; i < numSamples; i++) {
                 var sample = Math.sin(i * 440 * 2 * Math.PI / sampleRate) * 3;
                 view.setInt16(44 + i * 2, sample, true);
@@ -114,15 +95,11 @@
             var blob = new Blob([buffer], { type: 'audio/wav' });
             var url = URL.createObjectURL(blob);
             var audioEl2 = document.createElement('audio');
-            audioEl2.src = url;
-            audioEl2.loop = true;
-            audioEl2.volume = 0.001;
-            audioEl2.id = 'esnai-anti-throttle2';
+            audioEl2.src = url; audioEl2.loop = true; audioEl2.volume = 0.001; audioEl2.id = 'esnai-anti-throttle2';
             function tryPlay2() { audioEl2.play().catch(function () { setTimeout(tryPlay2, 3000); }); }
             if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', tryPlay2);
             else setTimeout(tryPlay2, 1000);
             document.addEventListener('click', function () { if (audioEl2.paused) audioEl2.play().catch(function () { }); }, { once: true });
-            log('真实静音WAV防节流已启动');
         } catch (e) { }
     }
 
@@ -170,7 +147,6 @@
     function hookTimersWithCompensation() {
         var origSetInterval = window.setInterval;
         var origSetTimeout = window.setTimeout;
-
         var STOP_KEYWORDS = ['stopTimer', 'stopStudy', 'pauseTimer', 'pauseStudy',
             'clearTimer', 'endStudy', 'stopCount', 'pauseCount', 'stopPlay', 'pausePlay'];
 
@@ -192,7 +168,6 @@
                     var missed = currentTick - lastFiredTick;
                     if (missed > 1) {
                         var compensateCount = Math.min(missed, 60);
-                        log('定时器补偿: 缺失', missed - 1, '个tick, 补回', compensateCount);
                         for (var j = 0; j < compensateCount; j++) {
                             try { fn.call(this); } catch (e) { }
                         }
@@ -217,434 +192,56 @@
             }
             return origSetTimeout.apply(this, arguments);
         };
-
-        log('定时器补偿机制已激活');
     }
 
     // ============================================================
-    // 六、网络请求拦截 —— 核心模块，修正上报时间
-    // 关键修复：URL查询参数、sendBeacon、请求前同步video.currentTime
+    // 六、核心：video.currentTime 持续推进引擎
+    // ESNAI 用 ckplayer，计时完全基于 video.currentTime
+    // 后台标签页视频暂停后 currentTime 不再增长，这才是计时偏小的根本原因
     // ============================================================
-    function hookNetworkRequests() {
-        var TIME_FIELDS_EXACT = new Set([
-            'second', 'sec', 'seconds', 'studytime', 'learntime', 'duration',
-            'elapsed', 'study_time', 'learn_time', 'play_time',
-            'studysecond', 'study_second', 'learnsecond', 'learn_second',
-            'playsecond', 'play_second', 'watchtime', 'watch_time',
-            'watchsecond', 'watch_second', 'totaltime', 'total_time',
-            'cumulativetime', 'cumulative_time', 'accumulatedtime', 'accumulated_time',
-            'effectivetime', 'effective_time', 'validtime', 'valid_time',
-            'coursetime', 'course_time', 'timersecond', 'countsecond', 'count_second',
-            'studylength', 'study_length', 'learnlength', 'learn_length',
-            'playlength', 'play_length', 'viewtime', 'view_time',
-            'viewduration', 'view_duration', 'studylen', 'learnlen', 'playlen',
-            'completedtime', 'completed_time', 'spenttime', 'spent_time',
-            'elapsedtime', 'elapsed_time', 'runningtime', 'running_time',
-            'activetime', 'active_time', 'onlinetime', 'online_time',
-            'learningtime', 'learning_time', 'studysec', 'learnsec', 'playsec',
-            'watchsec', 'coursesec', 'study_sec', 'learn_sec', 'play_sec',
-            'watch_sec', 'course_sec', 'accumulatedsec', 'accumulated_sec',
-            'totalsec', 'total_sec', 'studyduration', 'learnduration', 'playduration',
-            'study_duration', 'learn_duration', 'play_duration',
-            'studyprogress', 'learnprogress', 'courseprogress',
-            'study_progress', 'learn_progress', 'course_progress',
-        ]);
+    function startVideoTimeEngine() {
+        var lastKnownTime = 0;
+        var lastUpdateTime = Date.now();
 
-        var TIME_KEYWORDS_CONTAINS = [
-            'studytime', 'learntime', 'playtime', 'watchtime', 'coursetime',
-            'studysec', 'learnsec', 'playsec', 'studysecond', 'learnsecond',
-            'studyduration', 'learnduration', 'studyprogress', 'learnprogress',
-        ];
-
-        var EXCLUDED_FIELDS = new Set([
-            'timestamp', 'timezone', 'timeout', 'createtime', 'create_time',
-            'updatetime', 'update_time', 'deletetime', 'delete_time',
-            'starttime', 'start_time', 'endtime', 'end_time',
-            'logintime', 'login_time', 'registertime', 'register_time',
-            'servertime', 'server_time', 'currentposition', 'current_position',
-            'position', 'pos', 'progress',
-        ]);
-
-        function isTimeField(key) {
-            var k = key.toLowerCase().replace(/[^a-z_]/g, '');
-            if (EXCLUDED_FIELDS.has(k)) return false;
-            if (TIME_FIELDS_EXACT.has(k)) return true;
-            for (var i = 0; i < TIME_KEYWORDS_CONTAINS.length; i++) {
-                if (k.indexOf(TIME_KEYWORDS_CONTAINS[i]) !== -1) return true;
-            }
-            return false;
-        }
-
-        function isStudyRelatedRequest(url) {
-            if (!url || typeof url !== 'string') return false;
-            var u = url.toLowerCase();
-            return u.indexOf('studytime') !== -1 || u.indexOf('savestudy') !== -1 ||
-                u.indexOf('studyrecord') !== -1 || u.indexOf('learnrecord') !== -1 ||
-                u.indexOf('heartbeat') !== -1 || u.indexOf('keeplive') !== -1 ||
-                u.indexOf('keepalive') !== -1 || u.indexOf('reporttime') !== -1 ||
-                u.indexOf('updatetime') !== -1 ||
-                (u.indexOf('study') !== -1 && (u.indexOf('save') !== -1 || u.indexOf('update') !== -1 || u.indexOf('report') !== -1)) ||
-                (u.indexOf('learn') !== -1 && (u.indexOf('save') !== -1 || u.indexOf('update') !== -1 || u.indexOf('report') !== -1)) ||
-                (u.indexOf('course') !== -1 && (u.indexOf('progress') !== -1 || u.indexOf('record') !== -1)) ||
-                u.indexOf('timer') !== -1;
-        }
-
-        function isCheckCourseRequest(url) {
-            if (!url || typeof url !== 'string') return false;
-            var u = url.toLowerCase();
-            return u.indexOf('checkcourse') !== -1 || u.indexOf('simultaneous') !== -1 ||
-                u.indexOf('multiplay') !== -1 || u.indexOf('checkplay') !== -1;
-        }
-
-        // ★ 核心修复：修改URL中的时间查询参数
-        function modifyUrl(url, actualSec) {
-            if (!url || typeof url !== 'string') return { modified: url, changed: false };
-            try {
-                var urlObj = new URL(url, window.location.origin);
-                var changed = false;
-                urlObj.searchParams.forEach(function (value, key) {
-                    if (isTimeField(key)) {
-                        var num = parseInt(value, 10);
-                        if (!isNaN(num) && num >= 0 && num < actualSec) {
-                            urlObj.searchParams.set(key, String(actualSec));
-                            log('URL参数修正:', key, value, '->', actualSec);
-                            changed = true;
-                        }
-                    }
-                });
-                if (changed) return { modified: urlObj.toString(), changed: true };
-            } catch (e) { }
-            return { modified: url, changed: false };
-        }
-
-        function walkAndModify(obj, actualSec) {
-            if (typeof obj !== 'object' || obj === null) return false;
-            var changed = false;
-            for (var key in obj) {
-                if (typeof obj[key] === 'number') {
-                    if (isTimeField(key) && obj[key] >= 0 && obj[key] < actualSec) {
-                        log('修正字段:', key, obj[key], '->', actualSec);
-                        obj[key] = actualSec;
-                        changed = true;
-                    }
-                } else if (typeof obj[key] === 'string') {
-                    if (isTimeField(key)) {
-                        var num = parseInt(obj[key], 10);
-                        if (!isNaN(num) && num >= 0 && num < actualSec) {
-                            obj[key] = String(actualSec);
-                            changed = true;
-                        }
-                    }
-                } else if (typeof obj[key] === 'object') {
-                    if (walkAndModify(obj[key], actualSec)) changed = true;
-                }
-            }
-            return changed;
-        }
-
-        function modifyBody(body, actualSec) {
-            if (!body) return { modified: body, changed: false };
-
-            if (typeof FormData !== 'undefined' && body instanceof FormData) {
-                var changed = false;
-                var entries = [];
-                for (var pair of body.entries()) {
-                    if (isTimeField(pair[0])) {
-                        var num = parseInt(pair[1], 10);
-                        if (!isNaN(num) && num >= 0 && num < actualSec) {
-                            entries.push([pair[0], String(actualSec)]);
-                            changed = true;
-                            continue;
-                        }
-                    }
-                    entries.push([pair[0], pair[1]]);
-                }
-                if (changed) {
-                    var fd = new FormData();
-                    entries.forEach(function (p) { fd.append(p[0], p[1]); });
-                    return { modified: fd, changed: true };
-                }
-                return { modified: body, changed: false };
-            }
-
-            if (typeof URLSearchParams !== 'undefined' && body instanceof URLSearchParams) {
-                var changed2 = false;
-                for (var pair2 of body.entries()) {
-                    if (isTimeField(pair2[0])) {
-                        var num2 = parseInt(pair2[1], 10);
-                        if (!isNaN(num2) && num2 >= 0 && num2 < actualSec) {
-                            body.set(pair2[0], String(actualSec));
-                            changed2 = true;
-                        }
-                    }
-                }
-                return { modified: body, changed: changed2 };
-            }
-
-            if (typeof body === 'string') {
-                // JSON
-                try {
-                    var json = JSON.parse(body);
-                    if (walkAndModify(json, actualSec)) {
-                        return { modified: JSON.stringify(json), changed: true };
-                    }
-                } catch (e) { }
-
-                // URL-encoded
-                try {
-                    var params = new URLSearchParams(body);
-                    var changed3 = false;
-                    for (var pair3 of params.entries()) {
-                        if (isTimeField(pair3[0])) {
-                            var num3 = parseInt(pair3[1], 10);
-                            if (!isNaN(num3) && num3 >= 0 && num3 < actualSec) {
-                                params.set(pair3[0], String(actualSec));
-                                changed3 = true;
-                            }
-                        }
-                    }
-                    if (changed3) return { modified: params.toString(), changed: true };
-                } catch (e) { }
-
-                // 正则回退（修复v6.0删除的回退机制）
-                var modified = body;
-                var changed4 = false;
-                var patterns = [
-                    /([\"']?(?:second|sec|seconds|studytime|learntime|duration|elapsed|studysecond|watchtime|coursetime|totaltime|timersecond|countsecond|studysec|learnsec|playsec)[\"']?\s*[=:]\s*)(\d+)/gi,
-                    /([\"']?(?:study_time|learn_time|play_time|study_second|learn_second|play_second|watch_time|course_time|total_time|count_second|study_sec|learn_sec|play_sec)[\"']?\s*[=:]\s*)(\d+)/gi,
-                ];
-                patterns.forEach(function (pat) {
-                    modified = modified.replace(pat, function (match, prefix, numStr) {
-                        var num = parseInt(numStr, 10);
-                        if (!isNaN(num) && num >= 0 && num < actualSec) {
-                            changed4 = true;
-                            return prefix + actualSec;
-                        }
-                        return match;
-                    });
-                });
-                if (changed4) return { modified: modified, changed: true };
-
-                log('未匹配时间字段,body:', body.substring(0, 500));
-                return { modified: body, changed: false };
-            }
-
-            return { modified: body, changed: false };
-        }
-
-        // ★ 核心修复：发送请求前同步 video.currentTime
-        function syncVideoTimeBeforeReport() {
+        function tick() {
             var video = document.querySelector('video');
-            if (video) {
-                var actualSec = getActualSec();
+            if (!video) return;
+
+            var now = Date.now();
+            var actualSec = getActualSec();
+
+            if (!video.paused && !video.ended) {
+                lastKnownTime = video.currentTime;
+                lastUpdateTime = now;
+            }
+
+            // 如果视频被暂停或后台节流导致currentTime停滞
+            // 计算应该推进的时间量
+            var timeSinceLastUpdate = (now - lastUpdateTime) / 1000;
+            if (timeSinceLastUpdate > 3) {
+                // 视频进度停滞超过3秒，强制推进
+                var targetTime = lastKnownTime + timeSinceLastUpdate;
                 var duration = video.duration;
-                if (!isNaN(duration) && actualSec < duration || isNaN(duration)) {
-                    if (Math.floor(video.currentTime) < actualSec - 2) {
-                        log('请求前同步视频进度:', Math.floor(video.currentTime), '->', actualSec);
-                        video.currentTime = actualSec;
-                    }
+                if (!isNaN(duration) && targetTime > duration) {
+                    targetTime = duration;
                 }
+                if (!isNaN(duration) && targetTime <= duration || isNaN(duration)) {
+                    video.currentTime = targetTime;
+                    lastKnownTime = targetTime;
+                    lastUpdateTime = now;
+                    log('视频进度强制推进:', Math.floor(targetTime), '秒');
+                }
+            }
+
+            // 同时确保视频在播放
+            if (STATE.forcePlayEnabled && video.paused && !video.ended) {
+                video.play().catch(function () { });
             }
         }
 
-        // Hook XHR
-        var OriginalXHR = window.XMLHttpRequest;
-        var xhrOpen = OriginalXHR.prototype.open;
-        var xhrSend = OriginalXHR.prototype.send;
-
-        OriginalXHR.prototype.open = function (method, url) {
-            this._hookUrl = url;
-            this._hookMethod = method;
-            return xhrOpen.apply(this, arguments);
-        };
-
-        OriginalXHR.prototype.send = function (body) {
-            var url = this._hookUrl;
-
-            if (isCheckCourseRequest(url)) {
-                log('双课程检测已阻断:', url);
-                var self = this;
-                setTimeout(function () {
-                    try { if (typeof self.onreadystatechange === 'function') self.onreadystatechange(new Event('readystatechange')); } catch (e) { }
-                    try { if (typeof self.onload === 'function') self.onload(new ProgressEvent('load')); } catch (e) { }
-                    try { if (typeof self.onloadend === 'function') self.onloadend(new ProgressEvent('loadend')); } catch (e) { }
-                }, 50);
-                return;
-            }
-
-            if (isStudyRelatedRequest(url)) {
-                var actualSec = getActualSec();
-
-                // ★ 请求前同步视频时间
-                syncVideoTimeBeforeReport();
-
-                // ★ 修改URL查询参数
-                var urlResult = modifyUrl(url, actualSec);
-                if (urlResult.changed) {
-                    this._hookUrl = urlResult.modified;
-                    try { xhrOpen.call(this, this._hookMethod || 'GET', urlResult.modified, true); } catch (e) { }
-                    log('URL参数已修正');
-                }
-
-                // 修改body
-                log('学习请求:', url, '秒数:', actualSec, 'body:', body ? (typeof body === 'string' ? body.substring(0, 300) : '[FormData]') : '[空]');
-                var bodyResult = modifyBody(body, actualSec);
-                if (bodyResult.changed) {
-                    arguments[0] = bodyResult.modified;
-                    STATE.lastReportedSec = actualSec;
-                    log('上报时间已修正为:', actualSec, '秒');
-                }
-
-                // 记录发现的API
-                if (STATE.discoveredAPIs.length < 20) {
-                    STATE.discoveredAPIs.push({ url: url, method: this._hookMethod || 'POST' });
-                }
-            }
-
-            return xhrSend.apply(this, arguments);
-        };
-
-        // Hook fetch
-        var originalFetch = window.fetch;
-        window.fetch = function (input, init) {
-            try {
-                var url = (typeof input === 'string') ? input : (input instanceof Request) ? input.url : '';
-
-                if (isCheckCourseRequest(url)) {
-                    return Promise.resolve(new Response('{"code":0,"msg":"ok","data":{}}', { status: 200, headers: { 'Content-Type': 'application/json' } }));
-                }
-
-                if (isStudyRelatedRequest(url)) {
-                    var actualSec = getActualSec();
-                    syncVideoTimeBeforeReport();
-
-                    // 修改URL查询参数
-                    if (typeof input === 'string') {
-                        var urlResult = modifyUrl(input, actualSec);
-                        if (urlResult.changed) input = urlResult.modified;
-                    } else if (input instanceof Request) {
-                        var urlResult2 = modifyUrl(input.url, actualSec);
-                        if (urlResult2.changed) {
-                            input = new Request(urlResult2.modified, input);
-                        }
-                    }
-
-                    // 修改body
-                    if (init && init.body) {
-                        var bodyResult = modifyBody(init.body, actualSec);
-                        if (bodyResult.changed) {
-                            init.body = bodyResult.modified;
-                            STATE.lastReportedSec = actualSec;
-                            log('fetch 上报时间已修正为:', actualSec, '秒');
-                        }
-                    }
-                }
-            } catch (e) { }
-            return originalFetch.apply(this, arguments);
-        };
-
-        // ★ 核心：Hook navigator.sendBeacon
-        var origBeacon = navigator.sendBeacon ? navigator.sendBeacon.bind(navigator) : null;
-        if (origBeacon) {
-            navigator.sendBeacon = function (url, data) {
-                if (isStudyRelatedRequest(url)) {
-                    var actualSec = getActualSec();
-                    syncVideoTimeBeforeReport();
-                    log('sendBeacon 学习请求:', url, '秒数:', actualSec);
-
-                    // 修改URL参数
-                    var urlResult = modifyUrl(url, actualSec);
-
-                    // 修改data
-                    if (data) {
-                        var bodyResult = modifyBody(data, actualSec);
-                        if (bodyResult.changed) {
-                            STATE.lastReportedSec = actualSec;
-                            log('sendBeacon 上报时间已修正为:', actualSec, '秒');
-                            return origBeacon(urlResult.changed ? urlResult.modified : url, bodyResult.modified);
-                        }
-                    }
-
-                    return origBeacon(urlResult.changed ? urlResult.modified : url, data);
-                }
-                return origBeacon.apply(this, arguments);
-            };
-        }
-
-        // Hook WebSocket
-        var OrigWebSocket = window.WebSocket;
-        var wsSend = OrigWebSocket.prototype.send;
-        OrigWebSocket.prototype.send = function (data) {
-            try {
-                if (typeof data === 'string') {
-                    var actualSec = getActualSec();
-                    try {
-                        var json = JSON.parse(data);
-                        if (walkAndModify(json, actualSec)) {
-                            arguments[0] = JSON.stringify(json);
-                            log('WebSocket 上报时间已修正为:', actualSec, '秒');
-                        }
-                    } catch (e) {
-                        try {
-                            var params = new URLSearchParams(data);
-                            var changed = false;
-                            for (var pair of params.entries()) {
-                                if (isTimeField(pair[0])) {
-                                    var num = parseInt(pair[1], 10);
-                                    if (!isNaN(num) && num >= 0 && num < actualSec) {
-                                        params.set(pair[0], String(actualSec));
-                                        changed = true;
-                                    }
-                                }
-                            }
-                            if (changed) arguments[0] = params.toString();
-                        } catch (e2) { }
-                    }
-                }
-            } catch (e) { }
-            return wsSend.apply(this, arguments);
-        };
-
-        // ★ Hook 动态创建的 <img> 和 <script>（图片信标和JSONP）
-        var origSetAttribute = Element.prototype.setAttribute;
-        Element.prototype.setAttribute = function (name, value) {
-            if ((name === 'src' || name === 'href') && typeof value === 'string') {
-                if (isStudyRelatedRequest(value)) {
-                    var actualSec = getActualSec();
-                    var urlResult = modifyUrl(value, actualSec);
-                    if (urlResult.changed) {
-                        log('setAttribute URL参数修正:', name, value.substring(0, 100), '->', urlResult.modified.substring(0, 100));
-                        value = urlResult.modified;
-                    }
-                }
-            }
-            return origSetAttribute.call(this, name, value);
-        };
-
-        // 同时 hook src 属性赋值
-        var srcDesc = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'src') ||
-            Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'src');
-        if (srcDesc && srcDesc.set) {
-            var origSrcSet = srcDesc.set;
-            var origSrcGet = srcDesc.get;
-            Object.defineProperty(HTMLImageElement.prototype, 'src', {
-                get: origSrcGet,
-                set: function (value) {
-                    if (typeof value === 'string' && isStudyRelatedRequest(value)) {
-                        var actualSec = getActualSec();
-                        var urlResult = modifyUrl(value, actualSec);
-                        if (urlResult.changed) {
-                            log('img.src URL参数修正:', value.substring(0, 100));
-                            value = urlResult.modified;
-                        }
-                    }
-                    return origSrcSet.call(this, value);
-                },
-                configurable: true
-            });
-        }
-
-        log('网络请求拦截已激活（含URL参数/sendBeacon/WebSocket/图片信标）');
+        // 每2秒检查一次
+        setInterval(tick, 2000);
+        log('视频时间引擎已启动');
     }
 
     // ============================================================
@@ -735,7 +332,8 @@
             ['.play-btn', '.btn-play', '#playBtn', '#play',
                 '.vjs-big-play-button', '.video-play-btn',
                 'button[title="Play"]', 'button[title="播放"]',
-                '.prism-big-play-btn', '.xgplayer-start'].forEach(function (sel) {
+                '.prism-big-play-btn', '.xgplayer-start',
+                '.ckplayer-playswitch', '.ckplayer-play'].forEach(function (sel) {
                     var btn = document.querySelector(sel);
                     if (btn && btn.offsetParent !== null) btn.click();
                 });
@@ -760,7 +358,8 @@
         function handle() {
             ['.quiz-popup', '.popup-question', '.question-popup',
                 '.modal-quiz', '.exam-popup', '.dialog-quiz',
-                '.interact-popup', '.exam-interact', '.study-interact'].forEach(function (sel) {
+                '.interact-popup', '.exam-interact', '.study-interact',
+                '.layui-layer', '.layui-layer-dialog'].forEach(function (sel) {
                     document.querySelectorAll(sel).forEach(function (c) {
                         if (c.style.display === 'none' || c.offsetParent === null || c._ah) return;
                         c._ah = true;
@@ -825,37 +424,7 @@
     }
 
     // ============================================================
-    // 十一、本地计时器 + 视频进度同步
-    // ============================================================
-    function startLocalTimer() {
-        setInterval(function () {
-            STATE.localElapsed = getActualSec();
-            var video = document.querySelector('video');
-            if (video && STATE.forcePlayEnabled) {
-                var videoTime = Math.floor(video.currentTime);
-                var expectedTime = STATE.localElapsed;
-                var duration = video.duration;
-                if (expectedTime - videoTime > 5 && (!isNaN(duration) && expectedTime < duration || isNaN(duration))) {
-                    video.currentTime = expectedTime;
-                }
-            }
-        }, 2000);
-    }
-
-    // ============================================================
-    // 十二、心跳保活
-    // ============================================================
-    function startHeartbeat() {
-        setInterval(function () {
-            try {
-                if (window.heartbeat) window.heartbeat();
-                else if (window.keepAlive) window.keepAlive();
-            } catch (e) { }
-        }, 30000);
-    }
-
-    // ============================================================
-    // 十三、拦截平台停止计时函数
+    // 十一、拦截平台停止计时函数
     // ============================================================
     function hookPlatformFunctions() {
         function wait() {
@@ -882,47 +451,27 @@
     }
 
     // ============================================================
-    // 十四、差分扫描发现并保持平台计时变量
+    // 十二、差分扫描发现并保持平台计时变量
     // ============================================================
     function keepPlatformTimerAlive() {
         var snapshot = {};
         function takeSnapshot() {
             snapshot = {};
-            try {
-                for (var key in window) {
-                    try {
-                        if (typeof window[key] === 'number' && window[key] > 0) {
-                            snapshot[key] = window[key];
-                        }
-                    } catch (e) { }
-                }
-            } catch (e) { }
+            try { for (var key in window) { try { if (typeof window[key] === 'number' && window[key] > 0) snapshot[key] = window[key]; } catch (e) { } } } catch (e) { }
         }
-
         function findAndKeepTimers() {
             var actualSec = getActualSec();
-            var knownVars = [
-                'studyTime', 'studySeconds', 'studySec', 'studyTimer',
+            var knownVars = ['studyTime', 'studySeconds', 'studySec', 'studyTimer',
                 'learnTime', 'learnSeconds', 'learnSec', 'learnTimer',
                 'playTime', 'playSeconds', 'playSec', 'playTimer',
-                'watchTime', 'watchSeconds', 'watchSec',
-                'courseTime', 'courseSeconds', 'courseSec',
-                'timer', 'timerSeconds', 'timerSec',
-                'countSeconds', 'countSec', 'elapsedTime', 'elapsedSec',
-                'totalStudyTime', 'totalLearnTime',
-                'currentStudyTime', 'currentLearnTime',
-                'studyDuration', 'learnDuration',
-                'secondCount', 'secCount',
-                'study_time', 'learn_time', 'play_time',
-                'study_second', 'learn_second',
-            ];
+                'watchTime', 'watchSeconds', 'watchSec', 'courseTime',
+                'timer', 'timerSeconds', 'timerSec', 'countSeconds',
+                'elapsedTime', 'elapsedSec', 'secondCount', 'secCount'];
             knownVars.forEach(function (v) {
                 if (window[v] !== undefined && typeof window[v] === 'number' && window[v] < actualSec) {
                     window[v] = actualSec;
                 }
             });
-
-            // 差分扫描
             try {
                 var newSnapshot = {};
                 for (var key in window) {
@@ -935,11 +484,8 @@
                                     var k = key.toLowerCase();
                                     if (k.indexOf('id') === -1 && k.indexOf('code') === -1 &&
                                         k.indexOf('status') === -1 && k.indexOf('type') === -1 &&
-                                        k.indexOf('version') === -1 && k.indexOf('port') === -1 &&
-                                        k.indexOf('width') === -1 && k.indexOf('height') === -1 &&
-                                        k.indexOf('index') === -1 && k.indexOf('order') === -1 &&
-                                        k.indexOf('timestamp') === -1) {
-                                        log('差分发现计时变量:', key, snapshot[key], '->', newSnapshot[key], '修正为:', actualSec);
+                                        k.indexOf('version') === -1 && k.indexOf('timestamp') === -1) {
+                                        log('差分发现计时变量:', key, '修正为:', actualSec);
                                         window[key] = actualSec;
                                     }
                                 }
@@ -949,8 +495,6 @@
                 }
                 snapshot = newSnapshot;
             } catch (e) { }
-
-            // Vue
             try {
                 document.querySelectorAll('[__vue__]').forEach(function (el) {
                     var vm = el.__vue__;
@@ -958,9 +502,7 @@
                         for (var key in vm.$data) {
                             if (typeof vm.$data[key] === 'number' && vm.$data[key] < actualSec && vm.$data[key] > 0) {
                                 var k = key.toLowerCase();
-                                if (k.indexOf('time') !== -1 || k.indexOf('sec') !== -1 ||
-                                    k.indexOf('dur') !== -1 || k.indexOf('study') !== -1 ||
-                                    k.indexOf('learn') !== -1 || k.indexOf('play') !== -1) {
+                                if (k.indexOf('time') !== -1 || k.indexOf('sec') !== -1 || k.indexOf('study') !== -1) {
                                     vm.$data[key] = actualSec;
                                 }
                             }
@@ -969,14 +511,13 @@
                 });
             } catch (e) { }
         }
-
         takeSnapshot();
         setTimeout(takeSnapshot, 3000);
         setInterval(findAndKeepTimers, 3000);
     }
 
     // ============================================================
-    // 十五、iframe 处理
+    // 十三、iframe 处理
     // ============================================================
     function handleIframeVideos() {
         setInterval(function () {
@@ -997,19 +538,24 @@
     }
 
     // ============================================================
-    // 十六、ESNAI 播放器钩子
+    // 十四、ESNAI 播放器钩子（ckplayer）
     // ============================================================
     function hookESNAIPlayer() {
         function find() {
             ['player', 'videoPlayer', 'studyPlayer', 'coursePlayer', 'flashPlayer',
                 'mediaPlayer', 'polyvPlayer', 'ckPlayer', 'ckplayer'].forEach(function (name) {
                     if (window[name] && typeof window[name] === 'object') {
+                        log('检测到播放器:', name);
                         if (window[name].pause) {
                             var orig = window[name].pause.bind(window[name]);
                             window[name].pause = function () { if (STATE.forcePlayEnabled) return; return orig(); };
                         }
                         if (window[name].play) {
                             setInterval(function () { try { if (STATE.forcePlayEnabled) window[name].play(); } catch (e) { } }, 5000);
+                        }
+                        // ckplayer 特有：video属性
+                        if (window[name].video) {
+                            try { window[name].video.muted = true; window[name].video.play().catch(function () { }); } catch (e) { }
                         }
                     }
                 });
@@ -1018,7 +564,7 @@
     }
 
     // ============================================================
-    // 十七、Web Worker 计时
+    // 十五、Web Worker 计时
     // ============================================================
     function startWorkerTimer() {
         try {
@@ -1029,42 +575,7 @@
     }
 
     // ============================================================
-    // 十八、主动上报计时
-    // ============================================================
-    function startProactiveReporting() {
-        setInterval(function () {
-            var actualSec = getActualSec();
-            if (actualSec - STATE.lastReportedSec < 30) return;
-
-            var fns = ['saveStudyTime', 'reportStudyTime', 'updateStudyRecord',
-                'saveStudyRecord', 'reportRecord', 'updateTime', 'studyReport',
-                'learnReport', 'courseReport', 'submitStudyTime', 'reportProgress',
-                'saveProgress', 'updateProgress', 'studyHeartbeat', 'learnHeartbeat'];
-
-            for (var i = 0; i < fns.length; i++) {
-                if (typeof window[fns[i]] === 'function') {
-                    try { window[fns[i]](actualSec); STATE.lastReportedSec = actualSec; return; } catch (e) { }
-                }
-            }
-
-            if (STATE.discoveredAPIs.length > 0 && typeof GM_xmlhttpRequest !== 'undefined') {
-                var api = STATE.discoveredAPIs[STATE.discoveredAPIs.length - 1];
-                try {
-                    GM_xmlhttpRequest({
-                        method: api.method || 'POST',
-                        url: api.url.startsWith('http') ? api.url : window.location.origin + api.url,
-                        headers: { 'Content-Type': 'application/json' },
-                        data: JSON.stringify({ studyTime: actualSec, second: actualSec, duration: actualSec, time: actualSec }),
-                        onload: function () { STATE.lastReportedSec = actualSec; },
-                        onerror: function () { }
-                    });
-                } catch (e) { }
-            }
-        }, 30000);
-    }
-
-    // ============================================================
-    // 十九、页面卸载拦截
+    // 十六、页面卸载拦截
     // ============================================================
     function hookPageUnload() {
         window.addEventListener('beforeunload', function (e) { e.stopImmediatePropagation(); }, true);
@@ -1076,29 +587,26 @@
     // 初始化
     // ============================================================
     function init() {
-        log('========== ESNAI 助手 v7.0 启动 ==========');
+        log('========== ESNAI 助手 v8.0 启动 ==========');
 
         hookTimersWithCompensation();
         startAntiThrottlingAudio();
         hookDocumentVisibility();
         hookWindowBlur();
         hookDialogs();
-        hookNetworkRequests();
         hookPageUnload();
         startWorkerTimer();
-        startLocalTimer();
 
         function onDOMReady() {
             hookVideoPause();
+            startVideoTimeEngine();
             autoPlayOnLoad();
             autoHandlePopups();
             simulateUserActivity();
-            startHeartbeat();
             hookPlatformFunctions();
             keepPlatformTimerAlive();
             handleIframeVideos();
             hookESNAIPlayer();
-            startProactiveReporting();
             log('========== 所有模块初始化完成 ==========');
         }
 
